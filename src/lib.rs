@@ -37,11 +37,23 @@ enum Expr {
     VarRef(VarRef),
 }
 
+// I am thinking we'll have a few different implementations of
+// Sequence. e.g. backed by a collection, backend by
+// This probably could have been an alias IntoIterator ...
+trait Sequence: IntoIterator<Item=Value, IntoIter = dyn Iterator<Item = Value>> {
+}
+
+struct VecSequence {
+    v: Vec<Value>
+}
+
+
+
 enum Data {
     // We use Box so that this can go into our bindings.
     //   we should probably add a condition that the IntoIter should
     //   implement Copy or Clone
-    Sequence(Box<dyn IntoIterator<Item=Value, IntoIter = dyn Iterator<Item = Value>>>),
+    Sequence(Box<dyn Sequence>),
     Literal(Value),
 }
 
@@ -59,13 +71,15 @@ fn json_to_bool(value: &Value) -> bool {
 }
 
 
+// BTreeMap feels a bit heavyweight, when we imagine that there will only
+// be around a dozen variables probably
 type Bindings = BTreeMap<String, Value>;
 
 //
 // Returns an iterator that gives the bindings produced by nesting all the
 // for expressions
 fn forexp_to_iter(
-    for_: &Vec<(VarRef, Expr)>,
+    for_: &[(VarRef, Expr)],
     bindings: &Bindings,
 ) -> Box<dyn Iterator<Item = Result<Bindings, String>>> {
 
@@ -95,9 +109,7 @@ fn forexp_to_iter(
             },
         }
     } else {
-        let mut for_: Vec<(VarRef, Expr)> = for_.into_iter().cloned().collect();
-
-        let remaining = for_.split_off(1);
+        let remaining = &for_[1..];
 
         let (first_for_binding, first_for_expr) = &for_.first().unwrap();
 
@@ -177,7 +189,6 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
                         return None;
                     }
 
-                    // does this unwrap mean we are losing errors?
                     Some(eval_expr(&return_, &bindings))
                 }).collect::<Result<Vec<_>,_>>()?.into_iter();
 
