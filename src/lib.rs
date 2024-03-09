@@ -1,15 +1,16 @@
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::vec;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum CompOp { EQ, LT }
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Ordering { ASC, DESC }
 
 type Name = String;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct VarRef { ref_: Name }
 impl From<&str> for VarRef {
     fn from(s: &str) -> VarRef {
@@ -19,7 +20,7 @@ impl From<&str> for VarRef {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Expr {
     For{
         for_:  Vec<(VarRef, Expr)>, // for $x in collection("captains")
@@ -36,6 +37,14 @@ enum Expr {
     VarRef(VarRef),
 }
 
+enum Data {
+    // We use Box so that this can go into our bindings.
+    //   we should probably add a condition that the IntoIter should
+    //   implement Copy or Clone
+    Sequence(Box<dyn IntoIterator<Item=Value, IntoIter = dyn Iterator<Item = Value>>>),
+    Literal(Value),
+}
+
 
 fn json_to_bool(value: &Value) -> bool {
     match value {
@@ -49,11 +58,77 @@ fn json_to_bool(value: &Value) -> bool {
     }
 }
 
+
+type Bindings = BTreeMap<String, Value>;
+
+//
+// Returns an iterator that gives the bindings produced by nesting all the
+// for expressions
+fn forexp_to_iter(
+    for_: &Vec<(VarRef, Expr)>,
+    bindings: &Bindings,
+) -> Box<dyn Iterator<Item = Result<Bindings, String>>> {
+
+    if for_.is_empty() {
+        return Box::new(vec![].into_iter());
+    }
+
+    if for_.len() == 1 {
+        let (first_for_binding, first_for_expr) = &for_.first().unwrap();
+
+        match force_seq(first_for_expr, bindings) {
+            Ok(it) => {
+                let res_stream = it.map(|v| {
+
+                    // Create binding for the `for`
+                    let mut inner_bindings = bindings.clone();
+                    inner_bindings.insert(first_for_binding.ref_.to_owned(), v.to_owned());
+
+                    Ok(inner_bindings)
+                });
+                let res_vec = res_stream.collect::<Vec<Result<_,String>>>();
+
+                Box::new(res_vec.into_iter())
+            },
+            Err(err) => {
+                Box::new(vec![Err(err)].into_iter())
+            },
+        }
+    } else {
+        let mut for_: Vec<(VarRef, Expr)> = for_.into_iter().cloned().collect();
+
+        let remaining = for_.split_off(1);
+
+        let (first_for_binding, first_for_expr) = &for_.first().unwrap();
+
+        match force_seq(first_for_expr, bindings) {
+            Ok(it) => {
+                let res_vec =
+                    it.flat_map(|v| {
+
+                        let mut inner_bindings = bindings.clone();
+                        inner_bindings.insert(first_for_binding.ref_.to_owned(), v.to_owned());
+
+                        forexp_to_iter(&remaining, &inner_bindings).into_iter()
+                    }).collect::<Vec<Result<_,_>>>();
+
+                Box::new(res_vec.into_iter())
+            },
+            Err(err) => {
+                Box::new(vec![Err(err)].into_iter())
+            },
+        }
+
+    }
+}
+
+
 // In the next iteration of this eval_query, we will need to recursively
 // chain together the fors.
 // I think we may also want to have the notion of binding streams to
 // variables...
 //
+// This ought to take a set of binding too, in case it's a nested query
 fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
     match expr {
         Expr::For{for_, let_, where_, order, return_} => {
@@ -70,36 +145,43 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
             if for_.is_empty() {
                 return Err("Need for for now".to_owned());
             }
-            // TODO: use .first.or(Err(..))?
-            // TODO: use decomposition
-            let (first_for_binding, first_for_expr) = &for_[0];
 
-            Ok(Box::new(force_seq(first_for_expr, &BTreeMap::new())?.filter_map(|tuple| {
+            let res_stream = forexp_to_iter(for_, &BTreeMap::new())
+                .filter_map(|bindings_result| {
+                    if bindings_result.is_err() {
+                        let err = bindings_result.unwrap_err();
+                        return Some(Err(err));
+                    }
+                    let mut bindings = bindings_result.unwrap();
 
-                // Create binding for the `for`
-                let mut bindings = BTreeMap::new();
-                bindings.insert(first_for_binding.ref_.to_owned(), tuple);
+                    // Let bindings
+                    for let_binding in let_.iter() {
+                        // I think we have to assume at this point that
+                        // the the expressions have been checked
+                        let e_or_err = eval_expr(&let_binding.1, &bindings);
+                        if e_or_err.is_err() {
+                            let err = e_or_err.unwrap_err();
+                            return Some(Err(err))
+                        }
+                        let e = e_or_err.unwrap();
+                        bindings.insert(let_binding.0.ref_.to_owned(), e);
+                    }
 
-                // Let bindings
-                for let_binding in let_.iter() {
-                    // I think we have to assume at this point that
-                    // the the expressions have been checked
-                    let e = eval_expr(&let_binding.1, &bindings).unwrap_or(Value::Null);
-                    bindings.insert(let_binding.0.ref_.to_owned(), e);
-                }
+                    let where_result = eval_expr(&where_, &bindings);
+                    if where_result.is_err() {
+                        let err = where_result.unwrap_err();
+                        return Some(Err(err))
+                    }
+                    let cond_as_bool: bool = json_to_bool(&where_result.unwrap());
+                    if !cond_as_bool {
+                        return None;
+                    }
 
-                // TODO: where
-                let where_result = eval_expr(&where_, &bindings).unwrap_or(json!(false));
-                let cond_as_bool: bool = json_to_bool(&where_result);
-                if !cond_as_bool {
-                    return None;
-                }
+                    // does this unwrap mean we are losing errors?
+                    Some(eval_expr(&return_, &bindings))
+                }).collect::<Result<Vec<_>,_>>()?.into_iter();
 
-                // does this unwrap mean we are losing errors?
-                Some(eval_expr(&return_, &bindings).unwrap_or(Value::Null))
-            }).collect::<Vec<Value>>().into_iter()))
-            // ^^^ we will have to stop doing this in order to support
-            // multiple fors
+            Ok(Box::new(res_stream))
         },
         _ => {
             Err("top level expression must be a FLWOR".to_owned())
@@ -107,12 +189,14 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
     }
 }
 
-fn force_seq(expr: &Expr, bindings: &BTreeMap<Name, Value>) -> Result<Box<dyn Iterator<Item = Value>>, String> {
+fn force_seq(expr: &Expr, bindings: &Bindings) -> Result<Box<dyn Iterator<Item = Value>>, String> {
     match expr {
         Expr::For{ .. } => {
             eval_query(expr)
         },
-        // 
+        // we should not do this...!
+        // instead we need a sequence type
+        // fixme: Arrays should be emitted as a single value
         Expr::Array(values) => {
             // Should this in fact evaluate the values as they are pulled?
             // Or should that be saved for Sequence?
@@ -131,9 +215,22 @@ fn force_seq(expr: &Expr, bindings: &BTreeMap<Name, Value>) -> Result<Box<dyn It
             Ok(Box::new(Some(e).into_iter()))
         },
         Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
-        Expr::VarRef(_var_ref) => {
-            // Not sure if this is true or not
-            Err("VarRef: A variable cannot contain a sequence".to_owned())
+        Expr::VarRef(var_ref) => {
+
+            match bindings.get(&var_ref.ref_) {
+                Some(value) => {
+                    match value {
+                        Value::Array(v) => {
+                            let values = v.clone();
+                            Ok(Box::new(values.into_iter()))
+                        }
+                        _ => Err(format!("${} not a sequence", var_ref.ref_).to_owned())
+                    }
+                    // FIXME: switch binding type to use Data as value
+                    // return force_seq(value, bindings)
+                },
+                None => Err(format!("VarRef: {}", var_ref.ref_).to_owned()),
+            }
         }
     }
 }
@@ -146,7 +243,7 @@ fn force_seq(expr: &Expr, bindings: &BTreeMap<Name, Value>) -> Result<Box<dyn It
 // Or take a pull and an error function
 //
 // Needs to take an environment, or a tuple or something
-fn eval_expr(expr: &Expr, bindings: &BTreeMap<Name, Value>) -> Result<Value, String> {
+fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Value, String> {
     match expr {
         // This shouldn't be the case
         // it should just be the case that we consume the stream
@@ -191,7 +288,14 @@ fn eval_expr(expr: &Expr, bindings: &BTreeMap<Name, Value>) -> Result<Value, Str
 
 pub fn run_example() {
 
-    let source = Expr::Array(vec![
+    let source_x = Expr::Array(vec![
+        Expr::Literal(json!(1.0)),
+        Expr::Literal(json!(2.0)),
+        Expr::Literal(json!(3.0)),
+        Expr::Literal(json!(4.0)),
+        Expr::Literal(json!(5.0)),
+    ]);
+    let source_y = Expr::Array(vec![
         Expr::Literal(json!(1.0)),
         Expr::Literal(json!(2.0)),
         Expr::Literal(json!(3.0)),
@@ -200,7 +304,10 @@ pub fn run_example() {
     ]);
 
     let example_expr = Expr::For {
-        for_: vec![("x".into(), source)],
+        for_: vec![
+            ("x".into(), source_x),
+            ("y".into(), source_y),
+        ],
         let_: Vec::new(),
         where_: Box::new(Expr::Comp(
                 CompOp::LT,
@@ -208,7 +315,12 @@ pub fn run_example() {
                 Box::new(Expr::Literal(json!(3.0))),
         )),
         order: Vec::new(),
-        return_: Box::new(Expr::VarRef("x".into())),
+        return_: Box::new(
+            Expr::Array(vec![
+                        Expr::VarRef("x".into()),
+                        Expr::VarRef("y".into()),
+            ])
+        ),
     };
 
     match eval_query(&example_expr) {
@@ -216,5 +328,84 @@ pub fn run_example() {
             println!("{:?}", expr);
         }),
         Err(some_msg) => println!("{}", some_msg)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_two_for_expressions() {
+
+        let source_x = Expr::Array(vec![
+            Expr::Literal(json!(1.0)),
+            Expr::Literal(json!(2.0)),
+        ]);
+        let source_y = Expr::Array(vec![
+            Expr::Literal(json!(1.0)),
+            Expr::Literal(json!(2.0)),
+        ]);
+
+        let fors_: Vec<(VarRef, Expr)> = vec![
+            ("x".into(), source_x),
+            ("y".into(), source_y),
+        ];
+
+        let it = forexp_to_iter(&fors_, &BTreeMap::new());
+        let res: Vec<(Option<Value>, Option<Value>)> = it.map(|bindings_result| {
+            bindings_result.map(|bindings|{
+                let x: Option<Value> = bindings.get("x").cloned();
+                let y: Option<Value> = bindings.get("y").cloned();
+
+                (x, y)
+            })
+        }).collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(res, vec![
+                   (Some(json!(1.0)), Some(json!(1.0))),
+                   (Some(json!(1.0)), Some(json!(2.0))),
+                   (Some(json!(2.0)), Some(json!(1.0))),
+                   (Some(json!(2.0)), Some(json!(2.0))),
+        ])
+    }
+
+    #[test]
+    fn for_expansion_sub_iteration() {
+
+        let source_x =
+            Expr::Array(vec![
+                        Expr::Array(vec![
+                                    Expr::Literal(json!(1.0)),
+                                    Expr::Literal(json!(2.0)),
+                        ]),
+                        Expr::Array(vec![
+                                    Expr::Literal(json!(3.0)),
+                                    Expr::Literal(json!(4.0)),
+                        ]),
+            ]);
+
+        let fors_: Vec<(VarRef, Expr)> = vec![
+            ("x".into(), source_x),
+            ("y".into(), Expr::VarRef("x".into())),
+        ];
+
+        let it = forexp_to_iter(&fors_, &BTreeMap::new());
+        let res: Vec<(Option<Value>, Option<Value>)> = it.map(|bindings_result| {
+            bindings_result.map(|bindings|{
+                let x: Option<Value> = bindings.get("x").cloned();
+                let y: Option<Value> = bindings.get("y").cloned();
+
+                (x, y)
+            })
+        }).collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(res, vec![
+                   (Some(json!([1.0, 2.0])), Some(json!(1.0))),
+                   (Some(json!([1.0, 2.0])), Some(json!(2.0))),
+                   (Some(json!([3.0, 4.0])), Some(json!(3.0))),
+                   (Some(json!([3.0, 4.0])), Some(json!(4.0))),
+        ])
     }
 }
