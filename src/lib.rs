@@ -125,13 +125,14 @@ fn data_to_bool(data: Data) -> anyhow::Result<bool> {
     match data {
         Data::Sequence(seq) => {
             let mut iter = seq.get_iter();
-            if let Some(v0) = iter.next() {
-                if let Some(..) = iter.next() {
-                    anyhow::bail!("non-singleton sequence used as bool");
+            match (iter.next(), iter.next()) {
+                (None, None) => Ok(false),
+                (Some(v0), None) => Ok(json_to_bool(&v0)),
+                (Some(..), Some(..)) => {
+                    Err(anyhow!("non-singleton sequence used as bool"))
                 }
-                return Ok(json_to_bool(&v0));
+                (None, Some(..)) => panic!("broken iterator"),
             }
-            Ok(false)
         }
         Data::EmptySequence => Ok(false),
         Data::Value(value) => Ok(json_to_bool(&value)),
