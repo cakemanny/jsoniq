@@ -1,6 +1,6 @@
+use anyhow::anyhow;
 use serde_json::json;
 use serde_json::Value;
-use anyhow::anyhow;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::rc::Rc;
@@ -25,7 +25,9 @@ struct VarRef {
 }
 impl From<&str> for VarRef {
     fn from(s: &str) -> VarRef {
-        VarRef { ref_: s.to_string() }
+        VarRef {
+            ref_: s.to_string(),
+        }
     }
 }
 
@@ -48,7 +50,6 @@ enum Expr {
     Literal(Value),
     VarRef(VarRef),
 }
-
 
 // I am thinking we'll have a few different implementations of
 // Sequence. e.g. backed by a collection, backend by
@@ -163,51 +164,35 @@ fn forexp_to_iter(
     if for_.is_empty() {
         return Box::new(None.into_iter());
     }
+    let (var_ref, exp) = &for_.first().unwrap();
 
-    if for_.len() == 1 {
-        let (var_ref, exp) = &for_.first().unwrap();
+    match force_seq(exp, bindings) {
+        Ok(it) => {
+            let bind_var = |v: Value| {
+                // Create binding for the `for`
+                let mut inner_bindings = bindings.clone();
+                inner_bindings
+                    .insert(var_ref.ref_.to_owned(), Data::Value(v.to_owned()));
 
-        match force_seq(exp, bindings) {
-            Ok(it) => {
-                let res_stream = it.map(|v| {
-                    // Create binding for the `for`
-                    let mut inner_bindings = bindings.clone();
-                    inner_bindings.insert(
-                        var_ref.ref_.to_owned(),
-                        Data::Value(v.to_owned()),
-                    );
+                inner_bindings
+            };
 
-                    Ok(inner_bindings)
-                });
-                let res_vec = res_stream.collect::<Vec<anyhow::Result<_>>>();
-
-                Box::new(res_vec.into_iter())
-            }
-            Err(err) => Box::new(Some(Err(err)).into_iter()),
-        }
-    } else {
-        let remaining = &for_[1..];
-
-        let (var_ref, exp) = &for_.first().unwrap();
-
-        match force_seq(exp, bindings) {
-            Ok(it) => {
-                let res_vec = it
-                    .flat_map(|v| {
-                        let mut inner_bindings = bindings.clone();
-                        inner_bindings.insert(
-                            var_ref.ref_.to_owned(),
-                            Data::Value(v.to_owned()),
-                        );
-
-                        forexp_to_iter(&remaining, &inner_bindings).into_iter()
+            Box::new(if for_.len() == 1 {
+                it.map(bind_var)
+                    .map(Ok)
+                    .collect::<Vec<anyhow::Result<_>>>()
+                    .into_iter()
+            } else {
+                let remaining = &for_[1..];
+                it.map(bind_var)
+                    .flat_map(|inner_bindings| {
+                        forexp_to_iter(&remaining, &inner_bindings)
                     })
-                    .collect::<Vec<Result<_, _>>>();
-
-                Box::new(res_vec.into_iter())
-            }
-            Err(err) => Box::new(Some(Err(err)).into_iter()),
+                    .collect::<Vec<anyhow::Result<_>>>()
+                    .into_iter()
+            })
         }
+        Err(err) => Box::new(Some(Err(err)).into_iter()),
     }
 }
 
@@ -400,7 +385,9 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
                         let nr0 = nr.as_f64().ok_or(anyhow!("fmr"))?;
                         Ok(Data::Value(Value::Bool(nl0 < nr0)))
                     }
-                    _ => Err(anyhow!("comparison can only be done between numbers")),
+                    _ => Err(anyhow!(
+                        "comparison can only be done between numbers"
+                    )),
                 },
                 (Data::EmptySequence, _) | (_, Data::EmptySequence) => {
                     Ok(Data::EmptySequence)
