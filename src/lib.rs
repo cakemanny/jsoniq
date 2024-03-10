@@ -53,37 +53,15 @@ enum Expr {
 // Sequence. e.g. backed by a collection, backend by
 // This probably could have been an alias IntoIterator ...
 enum Sequence {
-    VecBackend(VecSequence),
+    VecBackend(Vec<Value>),
 }
 impl Sequence {
     // This is not so great given that we might hit errors when
     // reading sequences... I think
     fn get_iter(&self) -> Box<dyn Iterator<Item = Value>> {
         match self {
-            Sequence::VecBackend(vs) => Box::new(vs.to_owned().into_iter()),
+            Sequence::VecBackend(vs) => Box::new(vs.clone().into_iter()),
         }
-    }
-}
-
-// FIXME: This is pointless. we can just use a Vec
-// it may have made sesn when Sequence was a trait
-// This differs for a normal vec in the way that we clone the items each time
-#[derive(Debug, Clone)]
-struct VecSequence {
-    // ... could this be a slice / array ?
-    vec: Vec<Value>,
-}
-impl From<Vec<Value>> for VecSequence {
-    fn from(v: Vec<Value>) -> VecSequence {
-        VecSequence { vec: v }
-    }
-}
-impl IntoIterator for VecSequence {
-    type Item = Value;
-    type IntoIter = vec::IntoIter<Value>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.vec.into_iter()
     }
 }
 
@@ -110,7 +88,7 @@ impl Data {
                 if let Some(v2) = iter.next() {
                     let mut forced = vec![value, v2];
                     forced.extend(iter);
-                    Data::Sequence(Rc::new(Sequence::VecBackend(forced.into())))
+                    Data::Sequence(Rc::new(Sequence::VecBackend(forced)))
                 } else {
                     Data::Value(value)
                 }
@@ -188,13 +166,12 @@ fn forexp_to_iter(
     bindings: &Bindings,
 ) -> Box<dyn Iterator<Item = Result<Bindings, String>>> {
     if for_.is_empty() {
-        return Box::new(vec![].into_iter());
+        return Box::new(None.into_iter());
     }
 
     if for_.len() == 1 {
         let (var_ref, exp) = &for_.first().unwrap();
 
-        // TODO: can we use map_err for this?
         match force_seq(exp, bindings) {
             Ok(it) => {
                 let res_stream = it.map(|v| {
@@ -211,7 +188,7 @@ fn forexp_to_iter(
 
                 Box::new(res_vec.into_iter())
             }
-            Err(err) => Box::new(vec![Err(err)].into_iter()),
+            Err(err) => Box::new(Some(Err(err)).into_iter()),
         }
     } else {
         let remaining = &for_[1..];
@@ -234,7 +211,7 @@ fn forexp_to_iter(
 
                 Box::new(res_vec.into_iter())
             }
-            Err(err) => Box::new(vec![Err(err)].into_iter()),
+            Err(err) => Box::new(Some(Err(err)).into_iter()),
         }
     }
 }
@@ -271,40 +248,32 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
             }
 
             let data_stream = forexp_to_iter(for_, &BTreeMap::new())
-                .filter_map(|bindings_result| {
-                    if bindings_result.is_err() {
-                        let err = bindings_result.unwrap_err();
-                        return Some(Err(err));
-                    }
-                    let mut bindings = bindings_result.unwrap();
+                .map(|bindings_result| {
+                    let mut bindings = bindings_result?;
 
                     // Let bindings
                     for let_binding in let_.iter() {
                         // I think we have to assume at this point that
                         // the the expressions have been checked
-                        let data_or_err = eval_expr(&let_binding.1, &bindings);
-                        if data_or_err.is_err() {
-                            let err = data_or_err.unwrap_err();
-                            return Some(Err(err));
-                        }
-                        let data = data_or_err.unwrap();
+                        let data = eval_expr(&let_binding.1, &bindings)?;
                         bindings.insert(let_binding.0.ref_.to_owned(), data);
                     }
-
-                    // TODO: maybe move turn this into a match expr?
-                    let where_result = eval_expr(&where_, &bindings);
-                    if where_result.is_err() {
-                        let err = where_result.unwrap_err();
-                        return Some(Err(err));
+                    Ok(bindings)
+                })
+                .filter_map(|bindings_result| {
+                    let bindings = match bindings_result {
+                        Ok(bindings) => bindings,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let get_cond_as_bool =
+                        || Ok(data_to_bool(eval_expr(&where_, &bindings)?)?);
+                    match get_cond_as_bool() {
+                        Err(e) => return Some(Err(e)),
+                        Ok(false) => return None,
+                        // we fall through so that evaluation of return_ is
+                        // a bit separated from evaluation of where
+                        Ok(true) => {}
                     }
-                    let cond_as_bool_res = data_to_bool(where_result.unwrap());
-                    if cond_as_bool_res.is_err() {
-                        return Some(Err(cond_as_bool_res.unwrap_err()));
-                    }
-                    if !cond_as_bool_res.unwrap() {
-                        return None;
-                    }
-
                     Some(eval_expr(&return_, &bindings))
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -338,13 +307,15 @@ fn data_result_to_value_results(
             // once
             match datum {
                 Data::Value(value) => vec![Ok(value)],
-                Data::Sequence(seq) => seq.get_iter().map(|v| Ok(v)).collect::<Vec<_>>(),
+                Data::Sequence(seq) => {
+                    seq.get_iter().map(|v| Ok(v)).collect::<Vec<_>>()
+                }
                 Data::EmptySequence => vec![],
             }
-        },
+        }
         Err(msg) => {
             vec![Err(msg)]
-        },
+        }
     }
 }
 
@@ -354,18 +325,12 @@ fn force_seq(
 ) -> Result<Box<dyn Iterator<Item = Value>>, String> {
     match expr {
         Expr::For { .. } => eval_query(expr),
-        Expr::Sequence(exprs) => {
-            // TODO: reuse eval_expr ?
-            //  loop through values and evaluate each
-            let evaluated: Vec<_> = exprs
-                .iter()
-                .map(|x| eval_expr(x, bindings))
-                .flat_map(data_result_to_value_results)
-                .collect::<Result<_, _>>()?;
-            //
-            //   ^^^ it's not very sequency
-
-            Ok(Box::new(evaluated.into_iter()))
+        Expr::Sequence(..) => {
+            let data = eval_expr(expr, bindings)?;
+            match data {
+                Data::Sequence(seq) => Ok(seq.get_iter()),
+                _ => panic!("sequence did not evaluate to sequence"),
+            }
         }
         Expr::Array(..) => {
             let data = eval_expr(expr, bindings)?;
@@ -399,8 +364,7 @@ fn force_seq(
                 Data::Sequence(seq) => Ok(Box::new(seq.get_iter())),
                 Data::EmptySequence => Ok(Box::new(None.into_iter())),
                 Data::Value(value) => {
-                    let wrapped = vec![value.clone()];
-                    Ok(Box::new(wrapped.into_iter()))
+                    Ok(Box::new(Some(value.clone()).into_iter()))
                 }
             },
             None => Err(format!("VarRef: {}", var_ref.ref_).to_owned()),
@@ -454,21 +418,19 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Data, String> {
         }
         Expr::ArrayUnbox(subexp) => {
             // Array unboxing turns an array into a sequence
-            // an any other kind of value into the empty sequence 
-            let data = eval_expr(&subexp, bindings) ?;
+            // an any other kind of value into the empty sequence
+            let data = eval_expr(&subexp, bindings)?;
 
             match data {
                 Data::Value(Value::Array(values)) => {
-                    Ok(Data::Sequence(Rc::new(Sequence::VecBackend(values.into()))))
+                    Ok(Data::Sequence(Rc::new(Sequence::VecBackend(values))))
                 }
-                _ => Ok(Data::EmptySequence)
+                _ => Ok(Data::EmptySequence),
             }
         }
         Expr::Sequence(exprs) => {
             // since a sequence could include multiple sources (in the future)
             // it would be nice to return some sort of lazy thing
-            //
-            // TODO return a sequence
 
             let evaluated: Vec<_> = exprs
                 .iter()
@@ -476,9 +438,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Data, String> {
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
-            Ok(Data::Sequence(Rc::new(Sequence::VecBackend(
-                evaluated.into(),
-            ))))
+            Ok(Data::Sequence(Rc::new(Sequence::VecBackend(evaluated))))
         }
         Expr::Array(exprs) => {
             //  loop through exprs and evaluate each
@@ -561,11 +521,13 @@ mod tests {
                 bindings_result.map(|bindings| {
                     let undata = |d| match d {
                         Data::Value(v) => v,
-                        _ => panic!("expected value not sequence")
+                        _ => panic!("expected value not sequence"),
                     };
 
-                    let x: Option<Value> = bindings.get("x").cloned().map(undata);
-                    let y: Option<Value> = bindings.get("y").cloned().map(undata);
+                    let x: Option<Value> =
+                        bindings.get("x").cloned().map(undata);
+                    let y: Option<Value> =
+                        bindings.get("y").cloned().map(undata);
 
                     (x, y)
                 })
@@ -593,7 +555,10 @@ mod tests {
 
         let fors_: Vec<(VarRef, Expr)> = vec![
             ("x".into(), source_x),
-            ("y".into(), Expr::ArrayUnbox(Box::new(Expr::VarRef("x".into())))),
+            (
+                "y".into(),
+                Expr::ArrayUnbox(Box::new(Expr::VarRef("x".into()))),
+            ),
         ];
 
         let it = forexp_to_iter(&fors_, &BTreeMap::new());
@@ -602,10 +567,12 @@ mod tests {
                 bindings_result.map(|bindings| {
                     let undata = |d| match d {
                         Data::Value(v) => v,
-                        _ => panic!("expected value not sequence")
+                        _ => panic!("expected value not sequence"),
                     };
-                    let x: Option<Value> = bindings.get("x").cloned().map(undata);
-                    let y: Option<Value> = bindings.get("y").cloned().map(undata);
+                    let x: Option<Value> =
+                        bindings.get("x").cloned().map(undata);
+                    let y: Option<Value> =
+                        bindings.get("y").cloned().map(undata);
 
                     (x, y)
                 })
