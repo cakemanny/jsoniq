@@ -1,37 +1,49 @@
-use serde_json::Value;
+//TODO: use anyhow::Result;
 use serde_json::json;
+use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt::Debug;
+use std::rc::Rc;
 use std::vec;
 
 #[derive(Debug, Clone, Copy)]
-enum CompOp { EQ, LT }
+enum CompOp {
+    EQ,
+    LT,
+}
 #[derive(Debug, Clone, Copy)]
-enum Ordering { ASC, DESC }
+enum Ordering {
+    ASC,
+    DESC,
+}
 
 type Name = String;
 
 #[derive(Debug, Clone)]
-struct VarRef { ref_: Name }
+struct VarRef {
+    ref_: Name,
+}
 impl From<&str> for VarRef {
     fn from(s: &str) -> VarRef {
-        VarRef {
-            ref_: s.to_owned()
-        }
+        VarRef { ref_: s.to_owned() }
     }
 }
 
 #[derive(Debug, Clone)]
 enum Expr {
-    For{
-        for_:  Vec<(VarRef, Expr)>, // for $x in collection("captains")
+    For {
+        for_: Vec<(VarRef, Expr)>, // for $x in collection("captains")
         let_: Vec<(VarRef, Expr)>, // let $century := $x.century
-        where_: Box<Expr>, // where $x.name eq "Kathryn Janeway"
+        where_: Box<Expr>,         // where $x.name eq "Kathryn Janeway"
         order: Vec<(Expr, Ordering)>, // order by $x.name
         // TODO: group_by
-        return_: Box<Expr>,// return $x
+        return_: Box<Expr>, // return $x
     },
     // FnCall(Option<Name>, Name, Vec<Box<Expr>>), //
     Comp(CompOp, Box<Expr>, Box<Expr>),
+    ArrayUnbox(Box<Expr>),
+
+    Sequence(Vec<Expr>),
     Array(Vec<Expr>),
     Literal(Value),
     VarRef(VarRef),
@@ -40,23 +52,117 @@ enum Expr {
 // I am thinking we'll have a few different implementations of
 // Sequence. e.g. backed by a collection, backend by
 // This probably could have been an alias IntoIterator ...
-trait Sequence: IntoIterator<Item=Value, IntoIter = dyn Iterator<Item = Value>> {
+enum Sequence {
+    VecBackend(VecSequence),
+}
+impl Sequence {
+    // This is not so great given that we might hit errors when
+    // reading sequences... I think
+    fn get_iter(&self) -> Box<dyn Iterator<Item = Value>> {
+        match self {
+            Sequence::VecBackend(vs) => Box::new(vs.to_owned().into_iter()),
+        }
+    }
 }
 
+// FIXME: This is pointless. we can just use a Vec
+// it may have made sesn when Sequence was a trait
+// This differs for a normal vec in the way that we clone the items each time
+#[derive(Debug, Clone)]
 struct VecSequence {
-    v: Vec<Value>
+    // ... could this be a slice / array ?
+    vec: Vec<Value>,
+}
+impl From<Vec<Value>> for VecSequence {
+    fn from(v: Vec<Value>) -> VecSequence {
+        VecSequence { vec: v }
+    }
+}
+impl IntoIterator for VecSequence {
+    type Item = Value;
+    type IntoIter = vec::IntoIter<Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vec.into_iter()
+    }
 }
 
-
-
+// We are not currently implementing TryInto<Value> as in many cases
+// an empty sequence behaves differently from any value and thus
+// it may be useful to preserve the distinction into the use site
+#[derive(Clone)]
 enum Data {
     // We use Box so that this can go into our bindings.
     //   we should probably add a condition that the IntoIter should
     //   implement Copy or Clone
-    Sequence(Box<dyn Sequence>),
-    Literal(Value),
+    Sequence(Rc<Sequence>),
+    EmptySequence,
+    Value(Value),
 }
 
+impl Data {
+    /// force evaluates Sequences and turns them into Values or EmptySequences
+    /// if they contain exactly one or 0 items
+    fn force(self) -> Data {
+        if let Data::Sequence(seq) = self {
+            let mut iter = seq.get_iter();
+            if let Some(value) = iter.next() {
+                if let Some(v2) = iter.next() {
+                    let mut forced = vec![value, v2];
+                    forced.extend(iter);
+                    Data::Sequence(Rc::new(Sequence::VecBackend(forced.into())))
+                } else {
+                    Data::Value(value)
+                }
+            } else {
+                Data::EmptySequence
+            }
+        } else {
+            self
+        }
+    }
+}
+
+// we have to implement Debug manually due to the Rc
+impl Debug for Data {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Data::Sequence(_rc) => {
+                write!(f, "Sequence[..]")
+            }
+            Data::EmptySequence => {
+                write!(f, "EmptySequence[..]")
+            }
+            Data::Value(v) => {
+                write!(f, "Value[{}]", v)
+            }
+        }
+    }
+}
+
+// TODO: Can we make this a TryInto ?
+fn data_to_bool(data: Data) -> Result<bool, String> {
+    match data {
+        Data::Sequence(seq) => {
+            // This mess is caused by borrow checker fighting.
+            let s = Rc::as_ref(&seq);
+            let mut seq_len = 0;
+            for _ in s.get_iter() {
+                seq_len += 1;
+            }
+            if seq_len > 1 {
+                return Err("non-singleton sequence used as bool".to_owned());
+            }
+            // whether the sequence has a value
+            for v in s.get_iter() {
+                return Ok(json_to_bool(&v));
+            }
+            Ok(false)
+        }
+        Data::EmptySequence => Ok(false),
+        Data::Value(value) => Ok(json_to_bool(&value)),
+    }
+}
 
 fn json_to_bool(value: &Value) -> bool {
     match value {
@@ -70,10 +176,9 @@ fn json_to_bool(value: &Value) -> bool {
     }
 }
 
-
 // BTreeMap feels a bit heavyweight, when we imagine that there will only
 // be around a dozen variables probably
-type Bindings = BTreeMap<String, Value>;
+type Bindings = BTreeMap<String, Data>;
 
 //
 // Returns an iterator that gives the bindings produced by nesting all the
@@ -82,58 +187,57 @@ fn forexp_to_iter(
     for_: &[(VarRef, Expr)],
     bindings: &Bindings,
 ) -> Box<dyn Iterator<Item = Result<Bindings, String>>> {
-
     if for_.is_empty() {
         return Box::new(vec![].into_iter());
     }
 
     if for_.len() == 1 {
-        let (first_for_binding, first_for_expr) = &for_.first().unwrap();
+        let (var_ref, exp) = &for_.first().unwrap();
 
-        match force_seq(first_for_expr, bindings) {
+        // TODO: can we use map_err for this?
+        match force_seq(exp, bindings) {
             Ok(it) => {
                 let res_stream = it.map(|v| {
-
                     // Create binding for the `for`
                     let mut inner_bindings = bindings.clone();
-                    inner_bindings.insert(first_for_binding.ref_.to_owned(), v.to_owned());
+                    inner_bindings.insert(
+                        var_ref.ref_.to_owned(),
+                        Data::Value(v.to_owned()),
+                    );
 
                     Ok(inner_bindings)
                 });
-                let res_vec = res_stream.collect::<Vec<Result<_,String>>>();
+                let res_vec = res_stream.collect::<Vec<Result<_, String>>>();
 
                 Box::new(res_vec.into_iter())
-            },
-            Err(err) => {
-                Box::new(vec![Err(err)].into_iter())
-            },
+            }
+            Err(err) => Box::new(vec![Err(err)].into_iter()),
         }
     } else {
         let remaining = &for_[1..];
 
-        let (first_for_binding, first_for_expr) = &for_.first().unwrap();
+        let (var_ref, exp) = &for_.first().unwrap();
 
-        match force_seq(first_for_expr, bindings) {
+        match force_seq(exp, bindings) {
             Ok(it) => {
-                let res_vec =
-                    it.flat_map(|v| {
-
+                let res_vec = it
+                    .flat_map(|v| {
                         let mut inner_bindings = bindings.clone();
-                        inner_bindings.insert(first_for_binding.ref_.to_owned(), v.to_owned());
+                        inner_bindings.insert(
+                            var_ref.ref_.to_owned(),
+                            Data::Value(v.to_owned()),
+                        );
 
                         forexp_to_iter(&remaining, &inner_bindings).into_iter()
-                    }).collect::<Vec<Result<_,_>>>();
+                    })
+                    .collect::<Vec<Result<_, _>>>();
 
                 Box::new(res_vec.into_iter())
-            },
-            Err(err) => {
-                Box::new(vec![Err(err)].into_iter())
-            },
+            }
+            Err(err) => Box::new(vec![Err(err)].into_iter()),
         }
-
     }
 }
-
 
 // In the next iteration of this eval_query, we will need to recursively
 // chain together the fors.
@@ -141,10 +245,18 @@ fn forexp_to_iter(
 // variables...
 //
 // This ought to take a set of binding too, in case it's a nested query
+//
+// We ought to rewrite as multiple passes,
+// one that does some sort of preparation of sources (e.g. collections)
 fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
     match expr {
-        Expr::For{for_, let_, where_, order, return_} => {
-
+        Expr::For {
+            for_,
+            let_,
+            where_,
+            order: _, // TODO: implement ordering
+            return_,
+        } => {
             // 1. evaluate the rhs of the for_, and convert to a sequence
             // 2. for each tuple in the sequence
             //    bind the value to the variable in a map
@@ -158,7 +270,7 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
                 return Err("Need for for now".to_owned());
             }
 
-            let res_stream = forexp_to_iter(for_, &BTreeMap::new())
+            let data_stream = forexp_to_iter(for_, &BTreeMap::new())
                 .filter_map(|bindings_result| {
                     if bindings_result.is_err() {
                         let err = bindings_result.unwrap_err();
@@ -170,79 +282,129 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
                     for let_binding in let_.iter() {
                         // I think we have to assume at this point that
                         // the the expressions have been checked
-                        let e_or_err = eval_expr(&let_binding.1, &bindings);
-                        if e_or_err.is_err() {
-                            let err = e_or_err.unwrap_err();
-                            return Some(Err(err))
+                        let data_or_err = eval_expr(&let_binding.1, &bindings);
+                        if data_or_err.is_err() {
+                            let err = data_or_err.unwrap_err();
+                            return Some(Err(err));
                         }
-                        let e = e_or_err.unwrap();
-                        bindings.insert(let_binding.0.ref_.to_owned(), e);
+                        let data = data_or_err.unwrap();
+                        bindings.insert(let_binding.0.ref_.to_owned(), data);
                     }
 
+                    // TODO: maybe move turn this into a match expr?
                     let where_result = eval_expr(&where_, &bindings);
                     if where_result.is_err() {
                         let err = where_result.unwrap_err();
-                        return Some(Err(err))
+                        return Some(Err(err));
                     }
-                    let cond_as_bool: bool = json_to_bool(&where_result.unwrap());
-                    if !cond_as_bool {
+                    let cond_as_bool_res = data_to_bool(where_result.unwrap());
+                    if cond_as_bool_res.is_err() {
+                        return Some(Err(cond_as_bool_res.unwrap_err()));
+                    }
+                    if !cond_as_bool_res.unwrap() {
                         return None;
                     }
 
                     Some(eval_expr(&return_, &bindings))
-                }).collect::<Result<Vec<_>,_>>()?.into_iter();
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter();
 
-            Ok(Box::new(res_stream))
-        },
-        _ => {
-            Err("top level expression must be a FLWOR".to_owned())
+            let value_stream = data_stream.flat_map(data_to_values);
+
+            Ok(Box::new(value_stream))
         }
+        _ => Err("top level expression must be a FLWOR".to_owned()),
     }
 }
 
-fn force_seq(expr: &Expr, bindings: &Bindings) -> Result<Box<dyn Iterator<Item = Value>>, String> {
-    match expr {
-        Expr::For{ .. } => {
-            eval_query(expr)
-        },
-        // we should not do this...!
-        // instead we need a sequence type
-        // fixme: Arrays should be emitted as a single value
-        Expr::Array(values) => {
-            // Should this in fact evaluate the values as they are pulled?
-            // Or should that be saved for Sequence?
+// TODO: try to avoid vec if possible
+fn data_to_values(datum: Data) -> Vec<Value> {
+    match datum {
+        Data::Value(value) => vec![value],
+        Data::Sequence(seq) => seq.get_iter().collect::<Vec<_>>(),
+        Data::EmptySequence => vec![],
+    }
+}
 
+fn data_result_to_value_results(
+    data_result: Result<Data, String>,
+) -> Vec<Result<Value, String>> {
+    match data_result {
+        Ok(datum) => {
+            // TODO: think about how to factor out this, since it's the
+            // same as for data_to_values
+            // we duplicated it to avoid processing the iterator more than
+            // once
+            match datum {
+                Data::Value(value) => vec![Ok(value)],
+                Data::Sequence(seq) => seq.get_iter().map(|v| Ok(v)).collect::<Vec<_>>(),
+                Data::EmptySequence => vec![],
+            }
+        },
+        Err(msg) => {
+            vec![Err(msg)]
+        },
+    }
+}
+
+fn force_seq(
+    expr: &Expr,
+    bindings: &Bindings,
+) -> Result<Box<dyn Iterator<Item = Value>>, String> {
+    match expr {
+        Expr::For { .. } => eval_query(expr),
+        Expr::Sequence(exprs) => {
+            // TODO: reuse eval_expr ?
             //  loop through values and evaluate each
-            let evaluated: Vec<_> = values.iter()
+            let evaluated: Vec<_> = exprs
+                .iter()
                 .map(|x| eval_expr(x, bindings))
-                .collect::<Result<_,_>>()?;
+                .flat_map(data_result_to_value_results)
+                .collect::<Result<_, _>>()?;
+            //
+            //   ^^^ it's not very sequency
 
             Ok(Box::new(evaluated.into_iter()))
-        },
-
-        // Should atoms be sequences of length 1 or errors?
-        Expr::Comp(..) => {
-            let e = eval_expr(expr, bindings)?;
-            Ok(Box::new(Some(e).into_iter()))
-        },
-        Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
-        Expr::VarRef(var_ref) => {
-
-            match bindings.get(&var_ref.ref_) {
-                Some(value) => {
-                    match value {
-                        Value::Array(v) => {
-                            let values = v.clone();
-                            Ok(Box::new(values.into_iter()))
-                        }
-                        _ => Err(format!("${} not a sequence", var_ref.ref_).to_owned())
-                    }
-                    // FIXME: switch binding type to use Data as value
-                    // return force_seq(value, bindings)
-                },
-                None => Err(format!("VarRef: {}", var_ref.ref_).to_owned()),
+        }
+        Expr::Array(..) => {
+            let data = eval_expr(expr, bindings)?;
+            match data {
+                // Array should always evaluate to array in the success case
+                Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
+                _ => panic!("array did not evaluate to array"),
             }
         }
+
+        // Atoms become sequences of length 1
+        Expr::Comp(..) => {
+            let data = eval_expr(expr, bindings)?;
+            match data {
+                Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
+                Data::EmptySequence => Ok(Box::new(None.into_iter())),
+                Data::Sequence(..) => {
+                    panic!("comparison produced nonempty sequence")
+                }
+            }
+        }
+        Expr::ArrayUnbox(..) => {
+            // Since we know the values are in memory, I think it's ok
+            // to cheat and use the conversion to vec
+            let data = eval_expr(expr, bindings)?;
+            Ok(Box::new(data_to_values(data).into_iter()))
+        }
+        Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
+        Expr::VarRef(var_ref) => match bindings.get(&var_ref.ref_) {
+            Some(data) => match data {
+                Data::Sequence(seq) => Ok(Box::new(seq.get_iter())),
+                Data::EmptySequence => Ok(Box::new(None.into_iter())),
+                Data::Value(value) => {
+                    let wrapped = vec![value.clone()];
+                    Ok(Box::new(wrapped.into_iter()))
+                }
+            },
+            None => Err(format!("VarRef: {}", var_ref.ref_).to_owned()),
+        },
     }
 }
 
@@ -254,59 +416,97 @@ fn force_seq(expr: &Expr, bindings: &Bindings) -> Result<Box<dyn Iterator<Item =
 // Or take a pull and an error function
 //
 // Needs to take an environment, or a tuple or something
-fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Value, String> {
+fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Data, String> {
     match expr {
         // This shouldn't be the case
         // it should just be the case that we consume the stream
-        Expr::For{ .. } => Err("No FLWOR at this point".to_owned()),
+        Expr::For { .. } => Err("No FLWOR at this point".to_owned()),
         Expr::Comp(CompOp::LT, lhs, rhs) => {
-            let l: Value = eval_expr(&*lhs, bindings)?;
-            let r: Value = eval_expr(&*rhs, bindings)?;
-            match (l, r) {
-                (Value::Number(nl), Value::Number(nr)) => {
-                    let nl0 = nl.as_f64().ok_or("fml")?;
-                    let nr0 = nr.as_f64().ok_or("fmr")?;
-                    Ok(Value::Bool( nl0 < nr0 ))
+            // Or should we only evaluate rd if necessary?
+            let ld: Data = eval_expr(&*lhs, bindings)?.force();
+            let rd: Data = eval_expr(&*rhs, bindings)?.force();
+            match (ld, rd) {
+                (Data::Sequence(..), _) | (_, Data::Sequence(..)) => {
+                    Err("comparison on multivalued sequences".into())
                 }
-                _ => Err("comparison can only be done between numbers".to_owned())
-            }
-        },
-        Expr::Comp(CompOp::EQ, lhs, rhs) => {
-            let _l: Value = eval_expr(&*lhs, bindings)?;
-            let _r: Value = eval_expr(&*rhs, bindings)?;
-            // I think we actually just need to derive Equal to get this for
-            // free
-            Err("TODO: EQ".to_owned())
-        },
-        Expr::Array(values) => {
-            //  loop through values and evaluate each
-            let evaluated: Vec<Value> = values.iter()
-                .map(|x| eval_expr(x, bindings))
-                .collect::<Result<_,_>>()?;
-
-            Ok(Value::Array(evaluated))
-        },
-        Expr::Literal(atom) => Ok(atom.clone()),
-        Expr::VarRef(VarRef{ ref_ }) => {
-            match bindings.get(ref_) {
-                Some(value) => Ok(value.clone()),
-                None => Ok(Value::Null)
+                (Data::Value(l), Data::Value(r)) => match (l, r) {
+                    (Value::Number(nl), Value::Number(nr)) => {
+                        // TODO: use anyhow to avoid needing to flaunt these
+                        // errors
+                        let nl0 = nl.as_f64().ok_or("fml")?;
+                        let nr0 = nr.as_f64().ok_or("fmr")?;
+                        Ok(Data::Value(Value::Bool(nl0 < nr0)))
+                    }
+                    _ => Err("comparison can only be done between numbers"
+                        .to_owned()),
+                },
+                (Data::EmptySequence, _) | (_, Data::EmptySequence) => {
+                    Ok(Data::EmptySequence)
+                }
             }
         }
+        Expr::Comp(CompOp::EQ, lhs, rhs) => {
+            let _l: Data = eval_expr(&*lhs, bindings)?;
+            let _r: Data = eval_expr(&*rhs, bindings)?;
+            // I think we actually just need to derive Equal to get this for
+            // free... except for some sequence cases.
+            Err("TODO: EQ".to_owned())
+        }
+        Expr::ArrayUnbox(subexp) => {
+            // Array unboxing turns an array into a sequence
+            // an any other kind of value into the empty sequence 
+            let data = eval_expr(&subexp, bindings) ?;
+
+            match data {
+                Data::Value(Value::Array(values)) => {
+                    Ok(Data::Sequence(Rc::new(Sequence::VecBackend(values.into()))))
+                }
+                _ => Ok(Data::EmptySequence)
+            }
+        }
+        Expr::Sequence(exprs) => {
+            // since a sequence could include multiple sources (in the future)
+            // it would be nice to return some sort of lazy thing
+            //
+            // TODO return a sequence
+
+            let evaluated: Vec<_> = exprs
+                .iter()
+                .map(|x| eval_expr(x, bindings))
+                .flat_map(data_result_to_value_results)
+                .collect::<Result<_, _>>()?;
+
+            Ok(Data::Sequence(Rc::new(Sequence::VecBackend(
+                evaluated.into(),
+            ))))
+        }
+        Expr::Array(exprs) => {
+            //  loop through exprs and evaluate each
+            let evaluated: Vec<Value> = exprs
+                .iter()
+                .map(|x| eval_expr(x, bindings))
+                .flat_map(data_result_to_value_results)
+                .collect::<Result<_, _>>()?;
+
+            Ok(Data::Value(Value::Array(evaluated)))
+        }
+        Expr::Literal(atom) => Ok(Data::Value(atom.clone())),
+        Expr::VarRef(VarRef { ref_ }) => match bindings.get(ref_) {
+            Some(value) => Ok(value.clone()),
+            None => Ok(Data::Value(Value::Null)),
+        },
     }
 }
 
-
 pub fn run_example() {
-
-    let source_x = Expr::Array(vec![
+    let source_x = Expr::Sequence(vec![
         Expr::Literal(json!(1.0)),
         Expr::Literal(json!(2.0)),
         Expr::Literal(json!(3.0)),
         Expr::Literal(json!(4.0)),
         Expr::Literal(json!(5.0)),
     ]);
-    let source_y = Expr::Array(vec![
+    let source_y = Expr::Sequence(vec![
         Expr::Literal(json!(1.0)),
         Expr::Literal(json!(2.0)),
         Expr::Literal(json!(3.0)),
@@ -315,33 +515,27 @@ pub fn run_example() {
     ]);
 
     let example_expr = Expr::For {
-        for_: vec![
-            ("x".into(), source_x),
-            ("y".into(), source_y),
-        ],
+        for_: vec![("x".into(), source_x), ("y".into(), source_y)],
         let_: Vec::new(),
         where_: Box::new(Expr::Comp(
-                CompOp::LT,
-                Box::new(Expr::VarRef("x".into())),
-                Box::new(Expr::Literal(json!(3.0))),
+            CompOp::LT,
+            Box::new(Expr::VarRef("x".into())),
+            Box::new(Expr::Literal(json!(3.0))),
         )),
         order: Vec::new(),
-        return_: Box::new(
-            Expr::Array(vec![
-                        Expr::VarRef("x".into()),
-                        Expr::VarRef("y".into()),
-            ])
-        ),
+        return_: Box::new(Expr::Array(vec![
+            Expr::VarRef("x".into()),
+            Expr::VarRef("y".into()),
+        ])),
     };
 
     match eval_query(&example_expr) {
         Ok(result_set) => result_set.for_each(|expr| {
             println!("{:?}", expr);
         }),
-        Err(some_msg) => println!("{}", some_msg)
+        Err(some_msg) => println!("{}", some_msg),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -349,74 +543,84 @@ mod tests {
 
     #[test]
     fn combine_two_for_expressions() {
-
-        let source_x = Expr::Array(vec![
+        let source_x = Expr::Sequence(vec![
             Expr::Literal(json!(1.0)),
             Expr::Literal(json!(2.0)),
         ]);
-        let source_y = Expr::Array(vec![
+        let source_y = Expr::Sequence(vec![
             Expr::Literal(json!(1.0)),
             Expr::Literal(json!(2.0)),
         ]);
 
-        let fors_: Vec<(VarRef, Expr)> = vec![
-            ("x".into(), source_x),
-            ("y".into(), source_y),
-        ];
+        let fors_: Vec<(VarRef, Expr)> =
+            vec![("x".into(), source_x), ("y".into(), source_y)];
 
         let it = forexp_to_iter(&fors_, &BTreeMap::new());
-        let res: Vec<(Option<Value>, Option<Value>)> = it.map(|bindings_result| {
-            bindings_result.map(|bindings|{
-                let x: Option<Value> = bindings.get("x").cloned();
-                let y: Option<Value> = bindings.get("y").cloned();
+        let res: Vec<(Option<Value>, Option<Value>)> = it
+            .map(|bindings_result| {
+                bindings_result.map(|bindings| {
+                    let undata = |d| match d {
+                        Data::Value(v) => v,
+                        _ => panic!("expected value not sequence")
+                    };
 
-                (x, y)
+                    let x: Option<Value> = bindings.get("x").cloned().map(undata);
+                    let y: Option<Value> = bindings.get("y").cloned().map(undata);
+
+                    (x, y)
+                })
             })
-        }).collect::<Result<_, _>>().unwrap();
+            .collect::<Result<_, _>>()
+            .unwrap();
 
-        assert_eq!(res, vec![
-                   (Some(json!(1.0)), Some(json!(1.0))),
-                   (Some(json!(1.0)), Some(json!(2.0))),
-                   (Some(json!(2.0)), Some(json!(1.0))),
-                   (Some(json!(2.0)), Some(json!(2.0))),
-        ])
+        assert_eq!(
+            res,
+            vec![
+                (Some(json!(1.0)), Some(json!(1.0))),
+                (Some(json!(1.0)), Some(json!(2.0))),
+                (Some(json!(2.0)), Some(json!(1.0))),
+                (Some(json!(2.0)), Some(json!(2.0))),
+            ]
+        )
     }
 
     #[test]
     fn for_expansion_sub_iteration() {
-
-        let source_x =
-            Expr::Array(vec![
-                        Expr::Array(vec![
-                                    Expr::Literal(json!(1.0)),
-                                    Expr::Literal(json!(2.0)),
-                        ]),
-                        Expr::Array(vec![
-                                    Expr::Literal(json!(3.0)),
-                                    Expr::Literal(json!(4.0)),
-                        ]),
-            ]);
+        let source_x = Expr::Sequence(vec![
+            Expr::Literal(json!([1.0, 2.0])),
+            Expr::Literal(json!([3.0, 4.0])),
+        ]);
 
         let fors_: Vec<(VarRef, Expr)> = vec![
             ("x".into(), source_x),
-            ("y".into(), Expr::VarRef("x".into())),
+            ("y".into(), Expr::ArrayUnbox(Box::new(Expr::VarRef("x".into())))),
         ];
 
         let it = forexp_to_iter(&fors_, &BTreeMap::new());
-        let res: Vec<(Option<Value>, Option<Value>)> = it.map(|bindings_result| {
-            bindings_result.map(|bindings|{
-                let x: Option<Value> = bindings.get("x").cloned();
-                let y: Option<Value> = bindings.get("y").cloned();
+        let res: Vec<(Option<Value>, Option<Value>)> = it
+            .map(|bindings_result| {
+                bindings_result.map(|bindings| {
+                    let undata = |d| match d {
+                        Data::Value(v) => v,
+                        _ => panic!("expected value not sequence")
+                    };
+                    let x: Option<Value> = bindings.get("x").cloned().map(undata);
+                    let y: Option<Value> = bindings.get("y").cloned().map(undata);
 
-                (x, y)
+                    (x, y)
+                })
             })
-        }).collect::<Result<_, _>>().unwrap();
+            .collect::<Result<_, _>>()
+            .unwrap();
 
-        assert_eq!(res, vec![
-                   (Some(json!([1.0, 2.0])), Some(json!(1.0))),
-                   (Some(json!([1.0, 2.0])), Some(json!(2.0))),
-                   (Some(json!([3.0, 4.0])), Some(json!(3.0))),
-                   (Some(json!([3.0, 4.0])), Some(json!(4.0))),
-        ])
+        assert_eq!(
+            res,
+            vec![
+                (Some(json!([1.0, 2.0])), Some(json!(1.0))),
+                (Some(json!([1.0, 2.0])), Some(json!(2.0))),
+                (Some(json!([3.0, 4.0])), Some(json!(3.0))),
+                (Some(json!([3.0, 4.0])), Some(json!(4.0))),
+            ]
+        )
     }
 }
