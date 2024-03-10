@@ -1,6 +1,6 @@
-//TODO: use anyhow::Result;
 use serde_json::json;
 use serde_json::Value;
+use anyhow::anyhow;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::rc::Rc;
@@ -25,7 +25,7 @@ struct VarRef {
 }
 impl From<&str> for VarRef {
     fn from(s: &str) -> VarRef {
-        VarRef { ref_: s.to_owned() }
+        VarRef { ref_: s.to_string() }
     }
 }
 
@@ -48,6 +48,7 @@ enum Expr {
     Literal(Value),
     VarRef(VarRef),
 }
+
 
 // I am thinking we'll have a few different implementations of
 // Sequence. e.g. backed by a collection, backend by
@@ -84,13 +85,13 @@ impl Data {
     fn force(self) -> Data {
         if let Data::Sequence(seq) = self {
             let mut iter = seq.get_iter();
-            if let Some(value) = iter.next() {
-                if let Some(v2) = iter.next() {
-                    let mut forced = vec![value, v2];
+            if let Some(v0) = iter.next() {
+                if let Some(v1) = iter.next() {
+                    let mut forced = vec![v0, v1];
                     forced.extend(iter);
                     Data::Sequence(Rc::new(Sequence::VecBackend(forced)))
                 } else {
-                    Data::Value(value)
+                    Data::Value(v0)
                 }
             } else {
                 Data::EmptySequence
@@ -119,21 +120,15 @@ impl Debug for Data {
 }
 
 // TODO: Can we make this a TryInto ?
-fn data_to_bool(data: Data) -> Result<bool, String> {
+fn data_to_bool(data: Data) -> anyhow::Result<bool> {
     match data {
         Data::Sequence(seq) => {
-            // This mess is caused by borrow checker fighting.
-            let s = Rc::as_ref(&seq);
-            let mut seq_len = 0;
-            for _ in s.get_iter() {
-                seq_len += 1;
-            }
-            if seq_len > 1 {
-                return Err("non-singleton sequence used as bool".to_owned());
-            }
-            // whether the sequence has a value
-            for v in s.get_iter() {
-                return Ok(json_to_bool(&v));
+            let mut iter = seq.get_iter();
+            if let Some(v0) = iter.next() {
+                if let Some(..) = iter.next() {
+                    anyhow::bail!("non-singleton sequence used as bool");
+                }
+                return Ok(json_to_bool(&v0));
             }
             Ok(false)
         }
@@ -164,7 +159,7 @@ type Bindings = BTreeMap<String, Data>;
 fn forexp_to_iter(
     for_: &[(VarRef, Expr)],
     bindings: &Bindings,
-) -> Box<dyn Iterator<Item = Result<Bindings, String>>> {
+) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>>> {
     if for_.is_empty() {
         return Box::new(None.into_iter());
     }
@@ -184,7 +179,7 @@ fn forexp_to_iter(
 
                     Ok(inner_bindings)
                 });
-                let res_vec = res_stream.collect::<Vec<Result<_, String>>>();
+                let res_vec = res_stream.collect::<Vec<anyhow::Result<_>>>();
 
                 Box::new(res_vec.into_iter())
             }
@@ -225,7 +220,7 @@ fn forexp_to_iter(
 //
 // We ought to rewrite as multiple passes,
 // one that does some sort of preparation of sources (e.g. collections)
-fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
+fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For {
             for_,
@@ -244,7 +239,7 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
 
             // Start off basic
             if for_.is_empty() {
-                return Err("Need for for now".to_owned());
+                anyhow::bail!("Need for for now");
             }
 
             let data_stream = forexp_to_iter(for_, &BTreeMap::new())
@@ -283,7 +278,7 @@ fn eval_query(expr: &Expr) -> Result<Box<dyn Iterator<Item = Value>>, String> {
 
             Ok(Box::new(value_stream))
         }
-        _ => Err("top level expression must be a FLWOR".to_owned()),
+        _ => Err(anyhow!("top level expression must be a FLWOR")),
     }
 }
 
@@ -297,8 +292,8 @@ fn data_to_values(datum: Data) -> Vec<Value> {
 }
 
 fn data_result_to_value_results(
-    data_result: Result<Data, String>,
-) -> Vec<Result<Value, String>> {
+    data_result: anyhow::Result<Data>,
+) -> Vec<anyhow::Result<Value>> {
     match data_result {
         Ok(datum) => {
             // TODO: think about how to factor out this, since it's the
@@ -322,7 +317,7 @@ fn data_result_to_value_results(
 fn force_seq(
     expr: &Expr,
     bindings: &Bindings,
-) -> Result<Box<dyn Iterator<Item = Value>>, String> {
+) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For { .. } => eval_query(expr),
         Expr::Sequence(..) => {
@@ -367,7 +362,9 @@ fn force_seq(
                     Ok(Box::new(Some(value.clone()).into_iter()))
                 }
             },
-            None => Err(format!("VarRef: {}", var_ref.ref_).to_owned()),
+            // TODO: we should come up with our own errors for certain
+            // things
+            None => Err(anyhow!("VarRef: {}", var_ref.ref_)),
         },
     }
 }
@@ -380,29 +377,30 @@ fn force_seq(
 // Or take a pull and an error function
 //
 // Needs to take an environment, or a tuple or something
-fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Data, String> {
+fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
     match expr {
         // This shouldn't be the case
         // it should just be the case that we consume the stream
-        Expr::For { .. } => Err("No FLWOR at this point".to_owned()),
+        // TODO: actually nested FLWOR is supported
+        Expr::For { .. } => Err(anyhow!("No FLWOR at this point")),
         Expr::Comp(CompOp::LT, lhs, rhs) => {
             // Or should we only evaluate rd if necessary?
             let ld: Data = eval_expr(&*lhs, bindings)?.force();
             let rd: Data = eval_expr(&*rhs, bindings)?.force();
             match (ld, rd) {
                 (Data::Sequence(..), _) | (_, Data::Sequence(..)) => {
-                    Err("comparison on multivalued sequences".into())
+                    Err(anyhow!("comparison on multivalued sequences"))
                 }
                 (Data::Value(l), Data::Value(r)) => match (l, r) {
+                    // In the future we may be able to guard on
+                    // is_f64 and use some never type inference to
+                    // avoid this ugliness
                     (Value::Number(nl), Value::Number(nr)) => {
-                        // TODO: use anyhow to avoid needing to flaunt these
-                        // errors
-                        let nl0 = nl.as_f64().ok_or("fml")?;
-                        let nr0 = nr.as_f64().ok_or("fmr")?;
+                        let nl0 = nl.as_f64().ok_or(anyhow!("fml"))?;
+                        let nr0 = nr.as_f64().ok_or(anyhow!("fmr"))?;
                         Ok(Data::Value(Value::Bool(nl0 < nr0)))
                     }
-                    _ => Err("comparison can only be done between numbers"
-                        .to_owned()),
+                    _ => Err(anyhow!("comparison can only be done between numbers")),
                 },
                 (Data::EmptySequence, _) | (_, Data::EmptySequence) => {
                     Ok(Data::EmptySequence)
@@ -414,7 +412,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Data, String> {
             let _r: Data = eval_expr(&*rhs, bindings)?;
             // I think we actually just need to derive Equal to get this for
             // free... except for some sequence cases.
-            Err("TODO: EQ".to_owned())
+            todo!("EQ")
         }
         Expr::ArrayUnbox(subexp) => {
             // Array unboxing turns an array into a sequence
