@@ -157,18 +157,18 @@ type Bindings = BTreeMap<String, Data>;
 //
 // Returns an iterator that gives the bindings produced by nesting all the
 // for expressions
-fn forexp_to_iter(
-    for_: &[(VarRef, Expr)],
-    bindings: &Bindings,
-) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>>> {
+fn forexp_to_iter<'a>(
+    for_: &'a [(VarRef, Expr)],
+    bindings: Bindings,
+) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>> + 'a> {
     if for_.is_empty() {
         return Box::new(None.into_iter());
     }
     let (var_ref, exp) = &for_.first().unwrap();
 
-    match force_seq(exp, bindings) {
+    match force_seq(exp, &bindings) {
         Ok(it) => {
-            let bind_var = |v: Value| {
+            let bind_var = move |v: Value| {
                 // Create binding for the `for`
                 let mut inner_bindings = bindings.clone();
                 inner_bindings
@@ -177,20 +177,14 @@ fn forexp_to_iter(
                 inner_bindings
             };
 
-            Box::new(if for_.len() == 1 {
-                it.map(bind_var)
-                    .map(Ok)
-                    .collect::<Vec<anyhow::Result<_>>>()
-                    .into_iter()
+            if for_.len() == 1 {
+                Box::new(it.map(bind_var).map(Ok))
             } else {
                 let remaining = &for_[1..];
-                it.map(bind_var)
-                    .flat_map(|inner_bindings| {
-                        forexp_to_iter(&remaining, &inner_bindings)
-                    })
-                    .collect::<Vec<anyhow::Result<_>>>()
-                    .into_iter()
-            })
+                Box::new(it.map(bind_var).flat_map(|inner_bindings| {
+                    forexp_to_iter(remaining, inner_bindings)
+                }))
+            }
         }
         Err(err) => Box::new(Some(Err(err)).into_iter()),
     }
@@ -227,7 +221,7 @@ fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
                 anyhow::bail!("Need for for now");
             }
 
-            let data_stream = forexp_to_iter(for_, &BTreeMap::new())
+            let data_stream = forexp_to_iter(for_, BTreeMap::new())
                 .map(|bindings_result| {
                     let mut bindings = bindings_result?;
 
@@ -500,7 +494,7 @@ mod tests {
         let fors_: Vec<(VarRef, Expr)> =
             vec![("x".into(), source_x), ("y".into(), source_y)];
 
-        let it = forexp_to_iter(&fors_, &BTreeMap::new());
+        let it = forexp_to_iter(&fors_, BTreeMap::new());
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {
@@ -546,7 +540,7 @@ mod tests {
             ),
         ];
 
-        let it = forexp_to_iter(&fors_, &BTreeMap::new());
+        let it = forexp_to_iter(&fors_, BTreeMap::new());
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {
