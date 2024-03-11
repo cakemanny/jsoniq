@@ -54,18 +54,27 @@ enum Expr {
 // I am thinking we'll have a few different implementations of
 // Sequence. e.g. backed by a collection, backend by
 // This probably could have been an alias IntoIterator ...
+#[derive(Clone)]
 enum Sequence {
     VecBackend(Vec<Value>),
 }
 impl Sequence {
     // This is not so great given that we might hit errors when
     // reading sequences... I think
-    fn get_iter(&self) -> Box<dyn Iterator<Item = Value>> {
+    fn get_iter(self) -> Box<dyn Iterator<Item = Value>> {
         match self {
-            Sequence::VecBackend(vs) => Box::new(vs.clone().into_iter()),
+            Sequence::VecBackend(vs) => Box::new(vs.into_iter()),
         }
     }
 }
+impl IntoIterator for Sequence {
+    type Item = Value;
+    type IntoIter = Box<dyn Iterator<Item = Value>>;
+    fn into_iter(self: Self) -> Self::IntoIter {
+        self.get_iter()
+    }
+}
+
 
 // We are not currently implementing TryInto<Value> as in many cases
 // an empty sequence behaves differently from any value and thus
@@ -75,7 +84,7 @@ enum Data {
     // We use Box so that this can go into our bindings.
     //   we should probably add a condition that the IntoIter should
     //   implement Copy or Clone
-    Sequence(Rc<Sequence>),
+    Sequence(Sequence),
     EmptySequence,
     Value(Value),
 }
@@ -90,7 +99,7 @@ impl Data {
                 if let Some(v1) = iter.next() {
                     let mut forced = vec![v0, v1];
                     forced.extend(iter);
-                    Data::Sequence(Rc::new(Sequence::VecBackend(forced)))
+                    Data::Sequence(Sequence::VecBackend(forced))
                 } else {
                     Data::Value(v0)
                 }
@@ -321,13 +330,7 @@ fn force_seq(
         }
         Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
         Expr::VarRef(var_ref) => match bindings.get(&var_ref.ref_) {
-            Some(data) => match data {
-                Data::Sequence(seq) => Ok(Box::new(seq.get_iter())),
-                Data::EmptySequence => Ok(Box::new(None.into_iter())),
-                Data::Value(value) => {
-                    Ok(Box::new(Some(value.clone()).into_iter()))
-                }
-            },
+            Some(data) => Ok(data_to_values(data.clone())),
             // TODO: we should come up with our own errors for certain
             // things
             None => Err(anyhow!("VarRef: {}", var_ref.ref_)),
@@ -389,7 +392,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
 
             match data {
                 Data::Value(Value::Array(values)) => {
-                    Ok(Data::Sequence(Rc::new(Sequence::VecBackend(values))))
+                    Ok(Data::Sequence(Sequence::VecBackend(values)))
                 }
                 _ => Ok(Data::EmptySequence),
             }
@@ -404,7 +407,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
-            Ok(Data::Sequence(Rc::new(Sequence::VecBackend(evaluated))))
+            Ok(Data::Sequence(Sequence::VecBackend(evaluated)))
         }
         Expr::Array(exprs) => {
             //  loop through exprs and evaluate each
