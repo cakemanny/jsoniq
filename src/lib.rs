@@ -120,22 +120,24 @@ impl Debug for Data {
     }
 }
 
-// TODO: Can we make this a TryInto ?
-fn data_to_bool(data: Data) -> anyhow::Result<bool> {
-    match data {
-        Data::Sequence(seq) => {
-            let mut iter = seq.get_iter();
-            match (iter.next(), iter.next()) {
-                (None, None) => Ok(false),
-                (Some(v0), None) => Ok(json_to_bool(&v0)),
-                (Some(..), Some(..)) => {
-                    Err(anyhow!("non-singleton sequence used as bool"))
+impl TryInto<bool> for Data {
+    type Error = anyhow::Error;
+    fn try_into(self) -> Result<bool, Self::Error> {
+        match self {
+            Data::Sequence(seq) => {
+                let mut iter = seq.get_iter();
+                match (iter.next(), iter.next()) {
+                    (None, None) => Ok(false),
+                    (Some(v0), None) => Ok(json_to_bool(&v0)),
+                    (Some(..), Some(..)) => {
+                        Err(anyhow!("non-singleton sequence used as bool"))
+                    }
+                    (None, Some(..)) => panic!("broken iterator"),
                 }
-                (None, Some(..)) => panic!("broken iterator"),
             }
+            Data::EmptySequence => Ok(false),
+            Data::Value(value) => Ok(json_to_bool(&value)),
         }
-        Data::EmptySequence => Ok(false),
-        Data::Value(value) => Ok(json_to_bool(&value)),
     }
 }
 
@@ -222,7 +224,7 @@ fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
                 anyhow::bail!("Need for for now");
             }
 
-            let data_stream = forexp_to_iter(for_, BTreeMap::new())
+            let value_stream = forexp_to_iter(for_, BTreeMap::new())
                 .map(|bindings_result| {
                     let mut bindings = bindings_result?;
 
@@ -241,7 +243,7 @@ fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
                         Err(e) => return Some(Err(e)),
                     };
                     let get_cond_as_bool =
-                        || Ok(data_to_bool(eval_expr(&where_, &bindings)?)?);
+                        || Ok(eval_expr(&where_, &bindings)?.try_into()?);
                     match get_cond_as_bool() {
                         Err(e) => return Some(Err(e)),
                         Ok(false) => return None,
@@ -251,10 +253,9 @@ fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
                     }
                     Some(eval_expr(&return_, &bindings))
                 })
+                .flat_map(data_result_to_value_results)
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter();
-
-            let value_stream = data_stream.flat_map(data_to_values);
 
             Ok(Box::new(value_stream))
         }
@@ -262,35 +263,20 @@ fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     }
 }
 
-// TODO: try to avoid vec if possible
-fn data_to_values(datum: Data) -> Vec<Value> {
+fn data_to_values(datum: Data) -> Box<dyn Iterator<Item = Value>> {
     match datum {
-        Data::Value(value) => vec![value],
-        Data::Sequence(seq) => seq.get_iter().collect::<Vec<_>>(),
-        Data::EmptySequence => vec![],
+        Data::Value(value) => Box::new(Some(value).into_iter()),
+        Data::Sequence(seq) => Box::new(seq.get_iter()),
+        Data::EmptySequence => Box::new(None.into_iter()),
     }
 }
 
 fn data_result_to_value_results(
     data_result: anyhow::Result<Data>,
-) -> Vec<anyhow::Result<Value>> {
+) -> Box<dyn Iterator<Item = anyhow::Result<Value>>> {
     match data_result {
-        Ok(datum) => {
-            // TODO: think about how to factor out this, since it's the
-            // same as for data_to_values
-            // we duplicated it to avoid processing the iterator more than
-            // once
-            match datum {
-                Data::Value(value) => vec![Ok(value)],
-                Data::Sequence(seq) => {
-                    seq.get_iter().map(|v| Ok(v)).collect::<Vec<_>>()
-                }
-                Data::EmptySequence => vec![],
-            }
-        }
-        Err(msg) => {
-            vec![Err(msg)]
-        }
+        Ok(datum) => Box::new(data_to_values(datum).map(Ok)),
+        Err(msg) => Box::new(Some(Err(msg)).into_iter()),
     }
 }
 
@@ -331,7 +317,7 @@ fn force_seq(
             // Since we know the values are in memory, I think it's ok
             // to cheat and use the conversion to vec
             let data = eval_expr(expr, bindings)?;
-            Ok(Box::new(data_to_values(data).into_iter()))
+            Ok(Box::new(data_to_values(data)))
         }
         Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
         Expr::VarRef(var_ref) => match bindings.get(&var_ref.ref_) {
