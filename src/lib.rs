@@ -3,53 +3,11 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::rc::Rc;
 use std::vec;
 
-#[derive(Debug, Clone, Copy)]
-enum CompOp {
-    EQ,
-    LT,
-}
-#[derive(Debug, Clone, Copy)]
-enum Ordering {
-    ASC,
-    DESC,
-}
-
-type Name = String;
-
-#[derive(Debug, Clone)]
-struct VarRef {
-    ref_: Name,
-}
-impl From<&str> for VarRef {
-    fn from(s: &str) -> VarRef {
-        VarRef {
-            ref_: s.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum Expr {
-    For {
-        for_: Vec<(VarRef, Expr)>, // for $x in collection("captains")
-        let_: Vec<(VarRef, Expr)>, // let $century := $x.century
-        where_: Box<Expr>,         // where $x.name eq "Kathryn Janeway"
-        order: Vec<(Expr, Ordering)>, // order by $x.name
-        // TODO: group_by
-        return_: Box<Expr>, // return $x
-    },
-    // FnCall(Option<Name>, Name, Vec<Box<Expr>>), //
-    Comp(CompOp, Box<Expr>, Box<Expr>),
-    ArrayUnbox(Box<Expr>),
-
-    Sequence(Vec<Expr>),
-    Array(Vec<Expr>),
-    Literal(Value),
-    VarRef(VarRef),
-}
+pub mod ast;
+pub mod parse;
+use crate::ast::{CompOp, Expr, VarRef};
 
 // I am thinking we'll have a few different implementations of
 // Sequence. e.g. backed by a collection, backend by
@@ -74,7 +32,6 @@ impl IntoIterator for Sequence {
         self.get_iter()
     }
 }
-
 
 // We are not currently implementing TryInto<Value> as in many cases
 // an empty sequence behaves differently from any value and thus
