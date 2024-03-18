@@ -168,7 +168,7 @@ fn forexp_to_iter<'a>(
 //
 // We ought to rewrite as multiple passes,
 // one that does some sort of preparation of sources (e.g. collections)
-fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
+pub fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For {
             for_,

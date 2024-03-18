@@ -1,3 +1,5 @@
+use std::vec;
+
 use nom::{
     branch::alt,
     bytes::complete::{escaped, tag, take_while},
@@ -11,7 +13,7 @@ use nom::{
     sequence::{delimited, preceded, terminated, tuple},
     AsChar, Err, IResult,
 };
-use serde_json::{Number, Value};
+use serde_json::{json, Number, Value};
 
 use crate::ast::{CompOp, Expr, VarRef};
 
@@ -149,12 +151,34 @@ fn parse_for_line<'a>(i: &'a str) -> IResult<&'a str, Vec<(VarRef, Expr)>> {
     Ok((remaining, ins))
 }
 
+fn parse_return(i: &str) -> IResult<&str, Expr> {
+    preceded(kw("return"), cut(preceded(multispace0, parse_expr)))(i)
+}
+
+pub fn parse_flwor(i: &str) -> IResult<&str, Expr> {
+    // TODO: rest
+
+    let (remaining, (for_line, _, ret_expr)) =
+        tuple((parse_for_line, multispace0, parse_return))(i)?;
+    Ok((
+        remaining,
+        Expr::For {
+            for_: for_line,
+            let_: vec![],
+            where_: Box::new(Expr::Literal(json!(true))),
+            order: vec![],
+            return_: Box::new(ret_expr),
+        },
+    ))
+}
+
 fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
     // ... | array | object | literal
     // TODO: rest
     alt((
         map(parse_array, Expr::Array),
         map(parse_literal, Expr::Literal),
+        map(parse_var_ref, |s| Expr::VarRef(s.into())),
     ))(i)
 }
 
@@ -242,5 +266,15 @@ mod tests {
             parse_for_line("for $x innull"),
             Err(Err::Error(Error::new("innull", ErrorKind::Tag)))
         );
+    }
+
+    #[test]
+    fn test_parse_return() {
+        assert_eq!(
+            parse_return("return $x"),
+            Ok(("", Expr::VarRef("x".into())))
+        );
+        assert_eq!(parse_return("return$x"), parse_return("return $x"));
+        assert_eq!(parse_return("return  $x"), parse_return("return $x"));
     }
 }
