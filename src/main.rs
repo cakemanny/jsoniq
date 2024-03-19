@@ -4,31 +4,39 @@ use jsoniq::parse;
 use jsoniq::run_example;
 
 fn main() {
-    match rep() {
-        Ok(()) => {}
-        Err(e) => {
-            println!("error: {}", e);
-            return;
+    loop {
+        match rep() {
+            Ok(LoopState::Continue) => {}
+            Ok(LoopState::End) => {
+                return;
+            }
+            Err(e) => {
+                println!("error: {}", e);
+            }
         }
-    }
-
-    if false {
-        run_example();
+        if false {
+            run_example();
+        }
     }
 }
 
-fn rep() -> anyhow::Result<()> {
-    let mut buffer = String::new();
-    io::stdin().read_line(&mut buffer)?;
+enum LoopState {
+    Continue,
+    End,
+}
 
-    // I was unable to work out any other way
-    let buf_contents: &'static str = Box::leak(buffer.into_boxed_str());
-    match parse::parse_flwor(buf_contents) {
-        Ok((_, expr)) => {
-            jsoniq::eval_query(&expr)?
-                .for_each(|value| println!("{:?}", value));
-            Ok(())
-        }
-        Err(e) => Err(anyhow::Error::new(e)),
+/// REPL without the L
+fn rep() -> anyhow::Result<LoopState> {
+    let mut buffer = String::new();
+    let bytes_read = io::stdin().read_line(&mut buffer)?;
+    if bytes_read == 0 {
+        return Ok(LoopState::End);
     }
+
+    let (_, expr) = parse::parse_flwor(&buffer)
+        .map_err(|e| anyhow::Error::new(e.to_owned()))?;
+
+    jsoniq::eval_query(&expr)?.for_each(|value| println!("{:?}", value));
+
+    Ok(LoopState::Continue)
 }
