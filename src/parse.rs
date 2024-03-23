@@ -1,26 +1,28 @@
+//
+// Reference Grammar: https://www.jsoniq.org/grammars/jsoniq.xhtml
+//
 use std::vec;
 
 use nom::{
     branch::alt,
-    bytes::complete::{escaped, tag, take_while},
+    bytes::complete::{escaped, tag},
     character::complete::{
         alphanumeric1, char, multispace0, multispace1, one_of, satisfy,
     },
-    combinator::{cut, map, map_opt, value},
+    combinator::{cut, map, map_opt, opt, value},
     error::{context, make_error, ErrorKind, ParseError},
     multi::{separated_list0, separated_list1},
     number::complete::double,
-    sequence::{delimited, preceded, terminated, tuple},
-    AsChar, Err, IResult,
+    sequence::{delimited, pair, preceded, terminated, tuple},
+    AsChar, Err, IResult, Parser,
 };
 use serde_json::{json, Number, Value};
 
 use crate::ast::{CompOp, Expr, VarRef};
 
-fn sp<'a>(i: &'a str) -> IResult<&'a str, &'a str> {
-    let chars = " \t\r\n";
-    take_while(move |c| chars.contains(c))(i)
-}
+//
+// Lexical elements
+//
 
 /// Recognises a keyword
 ///
@@ -115,8 +117,29 @@ pub mod ws0 {
     where
         F: Fn(&'a str) -> IResult<&'a str, O, E>,
     {
-        terminated(inner, multispace0)
+        preceded(multispace0, inner)
     }
+}
+
+//
+// Compound Expressions
+//
+
+fn parenthesized_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
+    let p = preceded(
+        ws0::after(char('(')),
+        cut(terminated(opt(ws0::after(parse_sequence)), char(')'))),
+    )
+    .map(|opt_exprs| opt_exprs.unwrap_or_default());
+
+    map(p, |exprs| {
+        if exprs.len() == 1 {
+            exprs.first().unwrap().to_owned()
+        } else {
+            Expr::Sequence(exprs)
+        }
+    })
+    .parse(i)
 }
 
 fn parse_array(i: &str) -> IResult<&str, Vec<Expr>> {
@@ -131,41 +154,119 @@ fn parse_array(i: &str) -> IResult<&str, Vec<Expr>> {
     )(i)
 }
 
+fn primary_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
+    // ... | array | object
+    // TODO: rest
+    alt((
+        parenthesized_expr,
+        map(parse_array, Expr::Array),
+        map(parse_literal, Expr::Literal),
+        map(parse_var_ref, |s| Expr::VarRef(s.into())),
+    ))(i)
+}
+
+// ::= PrimaryExpr ( Predicate | ObjectLookup | ArrayLookup | ArrayUnboxing )*
+fn postfix_expr(i: &str) -> IResult<&str, Expr> {
+    fn parse_array_unboxing(
+        i: &str,
+    ) -> IResult<&str, impl FnOnce(Expr) -> Expr> {
+        value(
+            |e| Expr::ArrayUnbox(Box::new(e)),
+            pair(ws0::after(char('[')), char(']')),
+        )(i)
+    }
+
+    let (mut remaining, mut res) = primary_expr(i)?;
+
+    loop {
+        // This will turn into an alt that includes object lookup
+        match parse_array_unboxing(remaining) {
+            Ok((r, apply)) => {
+                res = apply(res);
+                remaining = r;
+            }
+            Err(Err::Error(_)) => return Ok((remaining, res)),
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn comparison_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
+    let (remaining, (lhs, opt_rhs)) = pair(
+        ws0::after(postfix_expr),
+        opt(pair(ws0::after(parse_comp_op), ws0::after(postfix_expr))),
+    )(i)?;
+
+    match opt_rhs {
+        None => Ok((remaining, lhs)),
+        Some((op, rhs)) => {
+            Ok((remaining, Expr::Comp(op, Box::new(lhs), Box::new(rhs))))
+        }
+    }
+}
+
+// ---
+
 fn parse_var_ref_in<'a>(i: &'a str) -> IResult<&'a str, (VarRef, Expr)> {
-    let (remaining, (var_ref, _, _, _, expr)) = tuple((
-        parse_var_ref,
-        multispace1,
-        kw("in"),
-        multispace0,
-        parse_expr,
-    ))(i)?;
+    let (remaining, (var_ref, _, _, expr)) =
+        tuple((parse_var_ref, multispace1, ws0::after(kw("in")), parse_expr))(
+            i,
+        )?;
     Ok((remaining, (var_ref.into(), expr)))
 }
 
 fn parse_for_line<'a>(i: &'a str) -> IResult<&'a str, Vec<(VarRef, Expr)>> {
-    let (remaining, (_, _, ins)) = tuple((
-        kw("for"),
-        multispace0,
-        separated_list1(char(','), parse_var_ref_in),
+    let (remaining, (_, ins)) = tuple((
+        ws0::after(kw("for")),
+        cut(separated_list1(ws0::after(char(',')), parse_var_ref_in)),
     ))(i)?;
     Ok((remaining, ins))
 }
 
+fn parse_let_binding<'a>(i: &'a str) -> IResult<&'a str, (VarRef, Expr)> {
+    let (remaining, (var_ref, _, expr)) =
+        tuple((parse_var_ref, ws0::around(colon_eq), parse_expr))(i)?;
+    Ok((remaining, (var_ref.into(), expr)))
+}
+
+fn parse_let_line(i: &str) -> IResult<&str, Vec<(VarRef, Expr)>> {
+    let (remaining, (_, bindings)) = tuple((
+        ws0::after(kw("let")),
+        separated_list1(ws0::after(char(',')), parse_let_binding),
+    ))(i)?;
+    Ok((remaining, bindings))
+}
+
+fn parse_where_line(i: &str) -> IResult<&str, Expr> {
+    let (remaining, (_, bindings)) =
+        tuple((ws0::after(kw("where")), parse_expr))(i)?;
+    Ok((remaining, bindings))
+}
+
 fn parse_return(i: &str) -> IResult<&str, Expr> {
-    preceded(kw("return"), cut(preceded(multispace0, parse_expr)))(i)
+    preceded(kw("return"), cut(ws0::before(parse_expr)))(i)
 }
 
 pub fn parse_flwor(i: &str) -> IResult<&str, Expr> {
     // TODO: rest
 
-    let (remaining, (for_line, _, ret_expr)) =
-        tuple((parse_for_line, multispace0, parse_return))(i)?;
+    let (remaining, (for_line, let_line_opt, where_line_opt, ret_expr)) =
+        tuple((
+            ws0::after(parse_for_line),
+            opt(ws0::after(parse_let_line)),
+            opt(ws0::after(parse_where_line)),
+            parse_return,
+        ))(i)?;
     Ok((
         remaining,
         Expr::For {
             for_: for_line,
-            let_: vec![],
-            where_: Box::new(Expr::Literal(json!(true))),
+            let_: let_line_opt.unwrap_or_default(),
+            where_: Box::new(
+                where_line_opt.unwrap_or(Expr::Literal(json!(true))),
+            ),
             order: vec![],
             return_: Box::new(ret_expr),
         },
@@ -173,13 +274,12 @@ pub fn parse_flwor(i: &str) -> IResult<&str, Expr> {
 }
 
 fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
-    // ... | array | object | literal
-    // TODO: rest
-    alt((
-        map(parse_array, Expr::Array),
-        map(parse_literal, Expr::Literal),
-        map(parse_var_ref, |s| Expr::VarRef(s.into())),
-    ))(i)
+    // TODO: logicals, arithmetic
+    comparison_expr(i)
+}
+
+fn parse_sequence<'a>(i: &'a str) -> IResult<&'a str, Vec<Expr>> {
+    separated_list1(ws0::after(char(',')), ws0::after(parse_expr)).parse(i)
 }
 
 // fncall identified , terminated('(', many0(expr)  ')')
@@ -189,6 +289,9 @@ mod tests {
     use super::*;
     use nom::error::{Error, ErrorKind};
     use serde_json::json;
+
+    // Lexical
+    // -------
 
     #[test]
     fn test_parse_bool() {
@@ -218,6 +321,44 @@ mod tests {
         assert_eq!(
             null("nuller"),
             Err(Err::Error(Error::new("nuller", ErrorKind::Tag)))
+        );
+    }
+
+    // Compound Exprs
+    // --------------
+
+    #[test]
+    fn test_parse_parenthesized_expr() {
+        assert_eq!(parse_expr("()"), Ok(("", Expr::Sequence(vec![]))));
+        assert_eq!(parse_expr("(  )"), Ok(("", Expr::Sequence(vec![]))));
+
+        assert_eq!(
+            parenthesized_expr("(1)"),
+            Ok(("", Expr::Literal(json!(1.0))))
+        );
+        assert_eq!(
+            parenthesized_expr("( 1 )"),
+            Ok(("", Expr::Literal(json!(1.0))))
+        );
+
+        assert_eq!(parse_expr("( )"), Ok(("", Expr::Sequence(vec![]))));
+        assert_eq!(
+            parse_expr("( 1 , 2 )"),
+            Ok((
+                "",
+                Expr::Sequence(vec![
+                    Expr::Literal(json!(1.0)),
+                    Expr::Literal(json!(2.0))
+                ])
+            ))
+        );
+    }
+
+    #[test]
+    fn test_postfix_expr() {
+        assert_eq!(
+            parse_expr("$x[]"),
+            Ok(("", Expr::ArrayUnbox(Box::new(Expr::VarRef("x".into())))))
         );
     }
 
@@ -259,12 +400,72 @@ mod tests {
             Ok(("", vec![(VarRef::from("x"), Expr::Array(vec![]))]))
         );
         assert_eq!(
+            parse_for_line("for $x in ()"),
+            Ok(("", vec![(VarRef::from("x"), Expr::Sequence(vec![]))]))
+        );
+        assert_eq!(
+            parse_for_line("for $x in (1,2)"),
+            Ok((
+                "",
+                vec![(
+                    VarRef::from("x"),
+                    Expr::Sequence(vec![
+                        Expr::Literal(json!(1.0)),
+                        Expr::Literal(json!(2.0)),
+                    ])
+                )]
+            ))
+        );
+        assert_eq!(
             parse_for_line("for$x in[]"),
             Ok(("", vec![(VarRef::from("x"), Expr::Array(vec![]))]))
         );
         assert_eq!(
             parse_for_line("for $x innull"),
-            Err(Err::Error(Error::new("innull", ErrorKind::Tag)))
+            Err(Err::Failure(Error::new("innull", ErrorKind::Tag)))
+        );
+        assert_eq!(
+            parse_for_line("for $x in [], $y in []"),
+            Ok((
+                "",
+                vec![
+                    (VarRef::from("x"), Expr::Array(vec![])),
+                    (VarRef::from("y"), Expr::Array(vec![])),
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_let_line() {
+        assert_eq!(
+            parse_let_line("let $y := 5"),
+            Ok(("", vec![(VarRef::from("y"), Expr::Literal(json!(5.0)))]))
+        );
+        assert_eq!(
+            parse_let_line("let $y := 5, $x := $y"),
+            Ok((
+                "",
+                vec![
+                    (VarRef::from("y"), Expr::Literal(json!(5.0))),
+                    (VarRef::from("x"), Expr::VarRef("y".into())),
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_where_line() {
+        assert_eq!(
+            parse_where_line("where $z eq 5"),
+            Ok((
+                "",
+                Expr::Comp(
+                    CompOp::EQ,
+                    Box::new(Expr::VarRef("z".into())),
+                    Box::new(Expr::Literal(json!(5.0)))
+                )
+            ))
         );
     }
 
@@ -276,5 +477,35 @@ mod tests {
         );
         assert_eq!(parse_return("return$x"), parse_return("return $x"));
         assert_eq!(parse_return("return  $x"), parse_return("return $x"));
+    }
+
+    #[test]
+    fn test_parse_flwor() {
+        assert_eq!(
+            parse_flwor(
+                "for $x in ()
+                let $y := $x
+                where $x lt 3
+                return [$x, $y]\n"
+            ),
+            Ok((
+                "",
+                Expr::For {
+                    for_: vec![(VarRef::from("x"), Expr::Sequence(vec![]))],
+                    let_: vec![(VarRef::from("y"), Expr::VarRef("x".into()))],
+                    where_: Box::new(Expr::Comp(
+                        CompOp::LT,
+                        Box::new(Expr::VarRef("x".into())),
+                        Box::new(Expr::Literal(json!(3.0))),
+                    )),
+                    order: vec![],
+                    return_: Box::new(Expr::Array(vec![
+                        Expr::VarRef("x".into()),
+                        Expr::VarRef("y".into()),
+                    ])),
+                }
+            ))
+        );
+        assert!(parse_flwor("for $x in () return $x\n").is_ok())
     }
 }

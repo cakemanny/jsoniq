@@ -1,9 +1,30 @@
+use std::env;
 use std::io;
+use std::io::Write;
+use std::process;
 
 use jsoniq::parse;
 use jsoniq::run_example;
 
+fn print_usage(mut w: impl Write) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(w, "jsoniq")?;
+    writeln!(w)?;
+    writeln!(w, "usage: jsoniq [options] <jsoniq expression>")?;
+    writeln!(w)?;
+    Ok(())
+}
+
 fn main() {
+
+    let args: Vec<_> = env::args().collect();
+
+    if args.len() < 2 {
+        print_usage(std::io::stderr()).unwrap();
+        process::exit(1);
+    }
+
+    // FIXME: evaluate the first argument
+
     loop {
         match rep() {
             Ok(LoopState::Continue) => {}
