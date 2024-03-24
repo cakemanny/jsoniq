@@ -4,7 +4,6 @@ use std::io::Write;
 use std::process;
 
 use jsoniq::parse;
-use jsoniq::run_example;
 
 fn print_usage(mut w: impl Write) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(w, "jsoniq")?;
@@ -23,22 +22,33 @@ fn main() {
         process::exit(1);
     }
 
-    // FIXME: evaluate the first argument
-
-    loop {
-        match rep() {
-            Ok(LoopState::Continue) => {}
-            Ok(LoopState::End) => {
-                return;
+    if args[1] == "-r" {
+        loop {
+            match rep() {
+                Ok(LoopState::Continue) => {}
+                Ok(LoopState::End) => {
+                    return;
+                }
+                Err(e) => {
+                    println!("error: {}", e);
+                }
             }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
-        if false {
-            run_example();
         }
     }
+
+    if let Err(e) = parse_and_eval(&args[1]) {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    }
+}
+
+fn parse_and_eval(program: &str) -> anyhow::Result<()> {
+    let (_, expr) = parse::parse_flwor(program)
+        .map_err(|e| anyhow::Error::new(e.to_owned()))?;
+
+    jsoniq::eval_query(&expr)?.for_each(|value| println!("{:?}", value));
+
+    Ok(())
 }
 
 enum LoopState {
@@ -53,11 +63,7 @@ fn rep() -> anyhow::Result<LoopState> {
     if bytes_read == 0 {
         return Ok(LoopState::End);
     }
-
-    let (_, expr) = parse::parse_flwor(&buffer)
-        .map_err(|e| anyhow::Error::new(e.to_owned()))?;
-
-    jsoniq::eval_query(&expr)?.for_each(|value| println!("{:?}", value));
+    parse_and_eval(&buffer)?;
 
     Ok(LoopState::Continue)
 }
