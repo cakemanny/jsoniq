@@ -1,8 +1,8 @@
 use anyhow::anyhow;
-use serde_json::json;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::io::Write;
 use std::vec;
 
 pub mod ast;
@@ -168,7 +168,9 @@ fn forexp_to_iter<'a>(
 //
 // We ought to rewrite as multiple passes,
 // one that does some sort of preparation of sources (e.g. collections)
-pub fn eval_query(expr: &Expr) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
+pub fn eval_query(
+    expr: &Expr,
+) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For {
             for_,
@@ -384,48 +386,27 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
     }
 }
 
-pub fn run_example() {
-    let source_x = Expr::Sequence(vec![
-        Expr::Literal(json!(1.0)),
-        Expr::Literal(json!(2.0)),
-        Expr::Literal(json!(3.0)),
-        Expr::Literal(json!(4.0)),
-        Expr::Literal(json!(5.0)),
-    ]);
-    let source_y = Expr::Sequence(vec![
-        Expr::Literal(json!(1.0)),
-        Expr::Literal(json!(2.0)),
-        Expr::Literal(json!(3.0)),
-        Expr::Literal(json!(4.0)),
-        Expr::Literal(json!(5.0)),
-    ]);
+pub fn run_program<W: Write>(program: &str, mut out: W) -> anyhow::Result<()> {
+    let (_, expr) = parse::parse_flwor(program)
+        .map_err(|e| anyhow::Error::new(e.to_owned()))?;
 
-    let example_expr = Expr::For {
-        for_: vec![("x".into(), source_x), ("y".into(), source_y)],
-        let_: Vec::new(),
-        where_: Box::new(Expr::Comp(
-            CompOp::LT,
-            Box::new(Expr::VarRef("x".into())),
-            Box::new(Expr::Literal(json!(3.0))),
-        )),
-        order: Vec::new(),
-        return_: Box::new(Expr::Array(vec![
-            Expr::VarRef("x".into()),
-            Expr::VarRef("y".into()),
-        ])),
-    };
 
-    match eval_query(&example_expr) {
-        Ok(result_set) => result_set.for_each(|expr| {
-            println!("{:?}", expr);
-        }),
-        Err(some_msg) => println!("{}", some_msg),
-    }
+    // TODO: next
+    // - Plan what a function table / library might look like...
+    //   - a map of names to &functions of a particular kind ?
+    // - Add a parameter to eval_query or eval_expr to take a library
+    // of functions
+    // - Add the function call expr to the ast and
+
+    eval_query(&expr)?.try_for_each(|value| writeln!(out, "{value}"))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn combine_two_for_expressions() {

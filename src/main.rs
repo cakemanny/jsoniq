@@ -1,9 +1,10 @@
 use std::env;
 use std::io;
+use std::io::stdout;
 use std::io::Write;
 use std::process;
 
-use jsoniq::parse;
+use jsoniq::run_program;
 
 fn print_usage(mut w: impl Write) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(w, "jsoniq")?;
@@ -43,12 +44,7 @@ fn main() {
 }
 
 fn parse_and_eval(program: &str) -> anyhow::Result<()> {
-    let (_, expr) = parse::parse_flwor(program)
-        .map_err(|e| anyhow::Error::new(e.to_owned()))?;
-
-    jsoniq::eval_query(&expr)?.for_each(|value| println!("{:?}", value));
-
-    Ok(())
+    run_program(program, stdout())
 }
 
 enum LoopState {
