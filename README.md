@@ -33,3 +33,8 @@ some line-oriented json. But as soon as it's necessary to do something a
 little more complicated it, the terseness becomes a barrier.
 JSONiq with its roots in query languages feels a much better fit for
 filtering, joining and other slightly more advanced tasks.
+
+
+
+Note, this is just in its infancy - just like my rust knowledge,
+so no judging at this point :)
