@@ -5,11 +5,12 @@ use std::vec;
 
 use nom::{
     branch::alt,
-    bytes::complete::{escaped, tag},
+    bytes::complete::{escaped, tag, take_while, take_while1},
     character::complete::{
-        alphanumeric1, char, multispace0, multispace1, one_of, satisfy,
+        alphanumeric1, char, multispace0, multispace1,
+        one_of, satisfy,
     },
-    combinator::{cut, map, map_opt, opt, value},
+    combinator::{all_consuming, cut, map, map_opt, opt, recognize, value},
     error::{context, make_error, ErrorKind, ParseError},
     multi::{separated_list0, separated_list1},
     number::complete::double,
@@ -59,7 +60,20 @@ fn parse_str<'a>(i: &'a str) -> IResult<&'a str, &'a str> {
 }
 
 fn parse_var_ref<'a>(i: &'a str) -> IResult<&'a str, &'a str> {
-    context("variable reference", preceded(char('$'), alphanumeric1))(i)
+    context("variable reference", preceded(char('$'), parse_name))(i)
+}
+
+fn parse_name(i: &str) -> IResult<&str, &str> {
+    // differs xml name by not including ':'
+    fn is_name_start_char(c: char) -> bool {
+        c.is_ascii_alphabetic() || c == '_'
+    }
+    // differs xml name, in that '.' is not allowed
+    fn is_name_char(c: char) -> bool {
+        is_name_start_char(c) || c == '-' || c.is_ascii_digit()
+    }
+
+    recognize(pair(take_while1(is_name_start_char), take_while(is_name_char)))(i)
 }
 
 fn boolean<'a>(input: &'a str) -> IResult<&'a str, bool> {
@@ -154,6 +168,20 @@ fn parse_array(i: &str) -> IResult<&str, Vec<Expr>> {
     )(i)
 }
 
+// TODO: support namespaces
+fn parse_fn_call(i: &str) -> IResult<&str, (&str, Vec<Expr>)> {
+    pair(
+        ws0::after(parse_name),
+        preceded(
+            ws0::after(char('(')),
+            cut(terminated(
+                separated_list0(ws0::after(char(',')), ws0::after(parse_expr)),
+                char(')'),
+            )),
+        ),
+    )(i)
+}
+
 fn primary_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
     // ... | array | object
     // TODO: rest
@@ -162,6 +190,7 @@ fn primary_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
         map(parse_array, Expr::Array),
         map(parse_literal, Expr::Literal),
         map(parse_var_ref, |s| Expr::VarRef(s.into())),
+        map(parse_fn_call, |(name, args)| Expr::FnCall((None, name.to_owned()), args))
     ))(i)
 }
 
@@ -249,7 +278,7 @@ fn parse_return(i: &str) -> IResult<&str, Expr> {
     preceded(kw("return"), cut(ws0::before(parse_expr)))(i)
 }
 
-pub fn parse_flwor(i: &str) -> IResult<&str, Expr> {
+fn parse_flwor(i: &str) -> IResult<&str, Expr> {
     // TODO: rest
 
     let (remaining, (for_line, let_line_opt, where_line_opt, ret_expr)) =
@@ -283,6 +312,10 @@ fn parse_sequence<'a>(i: &'a str) -> IResult<&'a str, Vec<Expr>> {
 }
 
 // fncall identified , terminated('(', many0(expr)  ')')
+
+pub fn parse_main_module(i: &str) -> IResult<&str, Expr> {
+    all_consuming(parse_flwor)(i)
+}
 
 #[cfg(test)]
 mod tests {
@@ -380,6 +413,19 @@ mod tests {
                 "",
                 vec![Expr::Literal(json!(1.0)), Expr::Literal(json!(2.0))]
             ))
+        );
+    }
+    #[test]
+    fn test_parse_fn_call() {
+        assert_eq!(
+            parse_fn_call("parse(1)"),
+            Ok(("", ("parse", vec![Expr::Literal(json!(1.0))])))
+        );
+        assert_eq!(
+            parse_fn_call("string-length7 ( 1 , 2 )"),
+            Ok(("", ("string-length7", vec![
+                     Expr::Literal(json!(1.0)),
+                     Expr::Literal(json!(2.0))])))
         );
     }
 

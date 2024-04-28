@@ -11,7 +11,10 @@ pub enum Ordering {
     DESC,
 }
 
+// is it possible to make Name a &str ? since it refers to the program text
+// or maybe some static text.
 type Name = String;
+type QName = (Option<Name>, Name);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarRef {
@@ -35,7 +38,7 @@ pub enum Expr {
         // TODO: group_by
         return_: Box<Expr>, // return $x
     },
-    // FnCall(Option<Name>, Name, Vec<Box<Expr>>), //
+    FnCall(QName, Vec<Expr>), // fn:concat("1","2")
     Comp(CompOp, Box<Expr>, Box<Expr>),
     ArrayUnbox(Box<Expr>),
 
@@ -44,3 +47,5 @@ pub enum Expr {
     Literal(Value),
     VarRef(VarRef),
 }
+
+// TODO: come up with a typed AST

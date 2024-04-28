@@ -1,6 +1,6 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::io::Write;
 use std::vec;
@@ -41,6 +41,9 @@ enum Data {
     // We use Box so that this can go into our bindings.
     //   we should probably add a condition that the IntoIter should
     //   implement Copy or Clone
+    // Later me: sequences may want to hold a reference to
+    //   1. the syntax tree
+    //   2. a possibly cached collection of "nodes" / file handle / ...
     Sequence(Sequence),
     EmptySequence,
     Value(Value),
@@ -119,23 +122,56 @@ fn json_to_bool(value: &Value) -> bool {
     }
 }
 
+// Do I need to learn about reference generics?
+fn cast_json_to_string(value: Value) -> anyhow::Result<String> {
+    match value {
+        Value::String(s) => Ok(s),
+        Value::Number(n) => Ok(format!("{}", n)),
+        Value::Null => Ok("null".to_owned()),
+        Value::Bool(b) => Ok(format!("{}", b)),
+        Value::Array(..) => Err(anyhow!("cannot cast array to string")),
+        Value::Object(..) => Err(anyhow!("cannot cast object to string")),
+    }
+}
+
+// Some sort of execution context
+// Why? we need a place to store the Available Documents and
+// Available Node Collections. That is, any call to collection with the same
+// parameter should give the same sequence - which implies that we have cached
+// them. (or we're using a database that gives consistent read... unlikely).
+
+// Since declarations are completely separated from the main query, we
+// can put the function library and the modules in the execution context.
+struct StaticContext {
+    functions: FnTable,
+}
+
+// This will contain the available documents and node collections
+struct DynamicContext {}
+
 // BTreeMap feels a bit heavyweight, when we imagine that there will only
 // be around a dozen variables probably
+// TODO: it's probably possible to have the key be a &str since
+// the names are coming from the program text.
 type Bindings = BTreeMap<String, Data>;
 
 //
 // Returns an iterator that gives the bindings produced by nesting all the
 // for expressions
-fn forexp_to_iter<'a>(
+fn forexp_to_iter<'a, 'ctx>(
     for_: &'a [(VarRef, Expr)],
     bindings: Bindings,
-) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>> + 'a> {
+    ctx: &'ctx StaticContext,
+) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>> + 'a>
+where
+    'ctx: 'a,
+{
     if for_.is_empty() {
         return Box::new(None.into_iter());
     }
     let (var_ref, exp) = &for_.first().unwrap();
 
-    match force_seq(exp, &bindings) {
+    match force_seq(exp, &bindings, ctx) {
         Ok(it) => {
             let bind_var = move |v: Value| {
                 // Create binding for the `for`
@@ -151,7 +187,7 @@ fn forexp_to_iter<'a>(
             } else {
                 let remaining = &for_[1..];
                 Box::new(it.map(bind_var).flat_map(|inner_bindings| {
-                    forexp_to_iter(remaining, inner_bindings)
+                    forexp_to_iter(remaining, inner_bindings, ctx)
                 }))
             }
         }
@@ -164,12 +200,12 @@ fn forexp_to_iter<'a>(
 // I think we may also want to have the notion of binding streams to
 // variables...
 //
-// This ought to take a set of binding too, in case it's a nested query
-//
 // We ought to rewrite as multiple passes,
 // one that does some sort of preparation of sources (e.g. collections)
-pub fn eval_query(
+fn eval_query(
     expr: &Expr,
+    bindings: &Bindings,
+    ctx: &StaticContext,
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For {
@@ -192,7 +228,7 @@ pub fn eval_query(
                 anyhow::bail!("Need for for now");
             }
 
-            let value_stream = forexp_to_iter(for_, BTreeMap::new())
+            let value_stream = forexp_to_iter(for_, bindings.clone(), ctx)
                 .map(|bindings_result| {
                     let mut bindings = bindings_result?;
 
@@ -200,7 +236,7 @@ pub fn eval_query(
                     for let_binding in let_.iter() {
                         // I think we have to assume at this point that
                         // the the expressions have been checked
-                        let data = eval_expr(&let_binding.1, &bindings)?;
+                        let data = eval_expr(&let_binding.1, &bindings, ctx)?;
                         bindings.insert(let_binding.0.ref_.to_owned(), data);
                     }
                     Ok(bindings)
@@ -211,7 +247,7 @@ pub fn eval_query(
                         Err(e) => return Some(Err(e)),
                     };
                     let get_cond_as_bool =
-                        || Ok(eval_expr(&where_, &bindings)?.try_into()?);
+                        || Ok(eval_expr(&where_, &bindings, ctx)?.try_into()?);
                     match get_cond_as_bool() {
                         Err(e) => return Some(Err(e)),
                         Ok(false) => return None,
@@ -219,7 +255,7 @@ pub fn eval_query(
                         // a bit separated from evaluation of where
                         Ok(true) => {}
                     }
-                    Some(eval_expr(&return_, &bindings))
+                    Some(eval_expr(&return_, &bindings, ctx))
                 })
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<Vec<_>, _>>()?
@@ -251,18 +287,23 @@ fn data_result_to_value_results(
 fn force_seq(
     expr: &Expr,
     bindings: &Bindings,
+    ctx: &StaticContext,
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
-        Expr::For { .. } => eval_query(expr),
+        Expr::For { .. } => eval_query(expr, bindings, ctx),
+        Expr::FnCall(_name, _args) => {
+            let data = eval_expr(expr, bindings, ctx)?;
+            Ok(data_to_values(data))
+        }
         Expr::Sequence(..) => {
-            let data = eval_expr(expr, bindings)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             match data {
                 Data::Sequence(seq) => Ok(seq.get_iter()),
                 _ => panic!("sequence did not evaluate to sequence"),
             }
         }
         Expr::Array(..) => {
-            let data = eval_expr(expr, bindings)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             match data {
                 // Array should always evaluate to array in the success case
                 Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
@@ -272,7 +313,7 @@ fn force_seq(
 
         // Atoms become sequences of length 1
         Expr::Comp(..) => {
-            let data = eval_expr(expr, bindings)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             match data {
                 Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
                 Data::EmptySequence => Ok(Box::new(None.into_iter())),
@@ -282,10 +323,8 @@ fn force_seq(
             }
         }
         Expr::ArrayUnbox(..) => {
-            // Since we know the values are in memory, I think it's ok
-            // to cheat and use the conversion to vec
-            let data = eval_expr(expr, bindings)?;
-            Ok(Box::new(data_to_values(data)))
+            let data = eval_expr(expr, bindings, ctx)?;
+            Ok(data_to_values(data))
         }
         Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
         Expr::VarRef(var_ref) => match bindings.get(&var_ref.ref_) {
@@ -305,16 +344,52 @@ fn force_seq(
 // Or take a pull and an error function
 //
 // Needs to take an environment, or a tuple or something
-fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
+fn eval_expr(
+    expr: &Expr,
+    bindings: &Bindings,
+    ctx: &StaticContext,
+) -> anyhow::Result<Data> {
     match expr {
         // This shouldn't be the case
         // it should just be the case that we consume the stream
         // TODO: actually nested FLWOR is supported
         Expr::For { .. } => Err(anyhow!("No FLWOR at this point")),
+        Expr::FnCall((_nsopt, name), args) => {
+            // We should define a static pass that checks this before
+            // execution.
+            let Some(jfn) = ctx.functions.get(name.as_str()) else {
+                bail!("no such function: {}", name);
+            };
+            if args.len() != jfn.num_args() {
+                bail!(
+                    "{} expects {} arguments but {} were given",
+                    name,
+                    jfn.num_args(),
+                    args.len()
+                )
+            };
+
+            // we could reverse it?
+            let mut evaluated_args: Vec<_> = args
+                .iter()
+                .map(|x| eval_expr(x, bindings, ctx))
+                .collect::<Result<_, _>>()?;
+
+            // Maybe we can learn to write macros an we'll end up writing
+            // this as macro.
+            match jfn {
+                JsoniqFn::Jfn1(f) => f(evaluated_args.remove(0)),
+                JsoniqFn::Jfn2(f) => {
+                    let arg1 = evaluated_args.remove(1);
+                    let arg0 = evaluated_args.remove(0);
+                    f(arg0, arg1)
+                }
+            }
+        }
         Expr::Comp(CompOp::LT, lhs, rhs) => {
             // Or should we only evaluate rd if necessary?
-            let ld: Data = eval_expr(&*lhs, bindings)?.force();
-            let rd: Data = eval_expr(&*rhs, bindings)?.force();
+            let ld: Data = eval_expr(&*lhs, bindings, ctx)?.force();
+            let rd: Data = eval_expr(&*rhs, bindings, ctx)?.force();
             match (ld, rd) {
                 (Data::Sequence(..), _) | (_, Data::Sequence(..)) => {
                     Err(anyhow!("comparison on multivalued sequences"))
@@ -338,8 +413,8 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
             }
         }
         Expr::Comp(CompOp::EQ, lhs, rhs) => {
-            let _l: Data = eval_expr(&*lhs, bindings)?;
-            let _r: Data = eval_expr(&*rhs, bindings)?;
+            let _l: Data = eval_expr(&*lhs, bindings, ctx)?;
+            let _r: Data = eval_expr(&*rhs, bindings, ctx)?;
             // I think we actually just need to derive Equal to get this for
             // free... except for some sequence cases.
             todo!("EQ")
@@ -347,7 +422,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
         Expr::ArrayUnbox(subexp) => {
             // Array unboxing turns an array into a sequence
             // an any other kind of value into the empty sequence
-            let data = eval_expr(&subexp, bindings)?;
+            let data = eval_expr(&subexp, bindings, ctx)?;
 
             match data {
                 Data::Value(Value::Array(values)) => {
@@ -362,7 +437,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
 
             let evaluated: Vec<_> = exprs
                 .iter()
-                .map(|x| eval_expr(x, bindings))
+                .map(|x| eval_expr(x, bindings, ctx))
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
@@ -372,7 +447,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
             //  loop through exprs and evaluate each
             let evaluated: Vec<Value> = exprs
                 .iter()
-                .map(|x| eval_expr(x, bindings))
+                .map(|x| eval_expr(x, bindings, ctx))
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
@@ -386,19 +461,73 @@ fn eval_expr(expr: &Expr, bindings: &Bindings) -> anyhow::Result<Data> {
     }
 }
 
+enum JsoniqFn {
+    Jfn1(fn(Data) -> anyhow::Result<Data>),
+    Jfn2(fn(Data, Data) -> anyhow::Result<Data>),
+}
+
+impl JsoniqFn {
+    fn num_args(self: &Self) -> usize {
+        match self {
+            JsoniqFn::Jfn1(..) => 1,
+            JsoniqFn::Jfn2(..) => 2,
+        }
+    }
+}
+
+/// The builtin function library
+mod jfn {
+    use super::*;
+
+    /// Casts it's arguments to strings and concatenates them.
+    ///
+    /// # Examples
+    ///
+    ///   fn:concat('Ciao!',()) -> "Ciao!"
+    ///   fn:concat('un', 'grateful') -> "ungrateful"
+    pub fn concat(a1: Data, a2: Data) -> anyhow::Result<Data> {
+        let to_str = |d: Data| match d.force() {
+            Data::Sequence(..) => {
+                Err(anyhow!("concat on multivalued sequence"))
+            }
+            Data::Value(v) => cast_json_to_string(v),
+            Data::EmptySequence => Ok("".to_owned()),
+        };
+        let s1 = to_str(a1)?;
+        let s2 = to_str(a2)?;
+        Ok(Data::Value(Value::String(s1 + &s2)))
+    }
+
+    // collection("captains")
+    pub fn collection(_uri: Data) -> anyhow::Result<Data> {
+        todo!("collection")
+    }
+}
+
+type FnTable = HashMap<&'static str, JsoniqFn>;
+
+fn base_fn_library() -> FnTable {
+    HashMap::from([
+        ("concat", JsoniqFn::Jfn2(jfn::concat)),
+        ("collection", JsoniqFn::Jfn1(jfn::collection)),
+    ])
+}
+
 pub fn run_program<W: Write>(program: &str, mut out: W) -> anyhow::Result<()> {
-    let (_, expr) = parse::parse_flwor(program)
+    let (_, expr) = parse::parse_main_module(program)
         .map_err(|e| anyhow::Error::new(e.to_owned()))?;
 
-
     // TODO: next
-    // - Plan what a function table / library might look like...
-    //   - a map of names to &functions of a particular kind ?
-    // - Add a parameter to eval_query or eval_expr to take a library
-    // of functions
-    // - Add the function call expr to the ast and
+    // - Try to implement the collection function call. This may mean extending
+    // our functions to take a dynamic context parameter.
 
-    eval_query(&expr)?.try_for_each(|value| writeln!(out, "{value}"))?;
+    let ctx = StaticContext {
+        functions: base_fn_library(),
+    };
+
+    let bindings = Bindings::new();
+    eval_query(&expr, &bindings, &ctx)?
+        .try_for_each(|value| writeln!(out, "{value}"))?;
 
     Ok(())
 }
@@ -410,6 +539,9 @@ mod tests {
 
     #[test]
     fn combine_two_for_expressions() {
+        let ctx = StaticContext {
+            functions: base_fn_library(),
+        };
         let source_x = Expr::Sequence(vec![
             Expr::Literal(json!(1.0)),
             Expr::Literal(json!(2.0)),
@@ -422,7 +554,7 @@ mod tests {
         let fors_: Vec<(VarRef, Expr)> =
             vec![("x".into(), source_x), ("y".into(), source_y)];
 
-        let it = forexp_to_iter(&fors_, BTreeMap::new());
+        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx);
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {
@@ -455,6 +587,9 @@ mod tests {
 
     #[test]
     fn for_expansion_sub_iteration() {
+        let ctx = StaticContext {
+            functions: base_fn_library(),
+        };
         let source_x = Expr::Sequence(vec![
             Expr::Literal(json!([1.0, 2.0])),
             Expr::Literal(json!([3.0, 4.0])),
@@ -468,7 +603,7 @@ mod tests {
             ),
         ];
 
-        let it = forexp_to_iter(&fors_, BTreeMap::new());
+        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx);
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {
