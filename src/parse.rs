@@ -199,22 +199,51 @@ fn primary_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
 
 // ::= PrimaryExpr ( Predicate | ObjectLookup | ArrayLookup | ArrayUnboxing )*
 fn postfix_expr(i: &str) -> IResult<&str, Expr> {
-    fn parse_array_unboxing(
-        i: &str,
-    ) -> IResult<&str, impl FnOnce(Expr) -> Expr> {
+    #[derive(Clone)]
+    enum PostfixApply {
+        ArrayUnbox,
+        ObjectLookup(Expr),
+    }
+
+    fn apply_postfix_apply(pf_apply: PostfixApply, e: Expr) -> Expr {
+        match pf_apply {
+            PostfixApply::ArrayUnbox => Expr::ArrayUnbox(Box::new(e)),
+            PostfixApply::ObjectLookup(lookup) => {
+                Expr::ObjectLookup(Box::new(e), Box::new(lookup))
+            }
+        }
+    }
+
+    fn parse_array_unboxing(i: &str) -> IResult<&str, PostfixApply> {
         value(
-            |e| Expr::ArrayUnbox(Box::new(e)),
+            PostfixApply::ArrayUnbox,
             pair(ws0::after(char('[')), char(']')),
         )(i)
     }
 
+    fn parse_object_lookup(i: &str) -> IResult<&str, PostfixApply> {
+        // TODO: this should support expressions
+
+        let alts = alt((
+            map(string, |s| Value::String(s.to_string())),
+            map(parse_name, |s| Value::String(s.to_string())),
+        ));
+        let alts_exp = map(alts, |s| Expr::Literal(s));
+
+        map(preceded(ws0::after(char('.')), alts_exp), |a| {
+            PostfixApply::ObjectLookup(a)
+        })(i)
+    }
+
     let (mut remaining, mut res) = primary_expr(i)?;
+
+    let mut single_post_fix = alt((parse_array_unboxing, parse_object_lookup));
 
     loop {
         // This will turn into an alt that includes object lookup
-        match parse_array_unboxing(remaining) {
+        match single_post_fix(remaining) {
             Ok((r, apply)) => {
-                res = apply(res);
+                res = apply_postfix_apply(apply, res);
                 remaining = r;
             }
             Err(Err::Error(_)) => return Ok((remaining, res)),

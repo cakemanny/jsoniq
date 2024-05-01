@@ -41,6 +41,7 @@ pub enum Expr {
     FnCall(QName, Vec<Expr>), // fn:concat("1","2")
     Comp(CompOp, Box<Expr>, Box<Expr>),
     ArrayUnbox(Box<Expr>),
+    ObjectLookup(Box<Expr>, Box<Expr>), // obj, lookup
 
     Sequence(Vec<Expr>),
     Array(Vec<Expr>),

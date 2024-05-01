@@ -16,6 +16,8 @@ use crate::ast::{CompOp, Expr, VarRef};
 #[derive(Clone)]
 enum Sequence {
     VecBackend(Vec<Value>),
+    // Want to do sth like this:
+    // MappedVec(Vec<Value>, Box<dyn FnOnce(Value) -> Value>),
 }
 impl Sequence {
     // This is not so great given that we might hit errors when
@@ -310,7 +312,7 @@ fn force_seq(
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For { .. } => eval_query(expr, bindings, ctx, dyn_ctx),
-        Expr::FnCall(_name, _args) => {
+        Expr::FnCall(_, _) | Expr::ObjectLookup(_, _) => {
             let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
             Ok(data_to_values(data))
         }
@@ -329,7 +331,6 @@ fn force_seq(
                 _ => panic!("array did not evaluate to array"),
             }
         }
-
         // Atoms become sequences of length 1
         Expr::Comp(..) => {
             let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
@@ -441,7 +442,7 @@ fn eval_expr(
         }
         Expr::ArrayUnbox(subexp) => {
             // Array unboxing turns an array into a sequence
-            // an any other kind of value into the empty sequence
+            // and any other kind of value into the empty sequence
             let data = eval_expr(&subexp, bindings, ctx, dyn_ctx)?;
 
             match data {
@@ -449,6 +450,46 @@ fn eval_expr(
                     Ok(Data::Sequence(Sequence::VecBackend(values)))
                 }
                 _ => Ok(Data::EmptySequence),
+            }
+        }
+        Expr::ObjectLookup(obj_exp, lookup_exp) => {
+            let lookup_data =
+                eval_expr(lookup_exp, bindings, ctx, dyn_ctx)?.force();
+            let lookup = match lookup_data {
+                Data::Sequence(..) | Data::EmptySequence => {
+                    return Err(anyhow!(
+                        "lookup expression cannot be a sequence"
+                    ))
+                }
+                Data::Value(v) => cast_json_to_string(v)?,
+            };
+
+            let obj = eval_expr(&obj_exp, bindings, ctx, dyn_ctx)?;
+
+            let perform_lookup = |value| match value {
+                Value::Object(m) => {
+                    let d = m
+                        .get(lookup.as_str())
+                        .map_or(Data::EmptySequence, |v| {
+                            Data::Value(v.to_owned())
+                        });
+                    d
+                }
+                _ => Data::EmptySequence,
+            };
+
+            match obj {
+                Data::Sequence(xs) => {
+                    // and here a lazy sequence would be ideal
+                    let mapped = xs
+                        .get_iter()
+                        .map(perform_lookup)
+                        .flat_map(data_to_values)
+                        .collect::<Vec<_>>();
+                    Ok(Data::Sequence(Sequence::VecBackend(mapped)))
+                }
+                Data::EmptySequence => Ok(obj),
+                Data::Value(value) => Ok(perform_lookup(value)),
             }
         }
         Expr::Sequence(exprs) => {
