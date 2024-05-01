@@ -5,11 +5,8 @@ use std::vec;
 
 use nom::{
     branch::alt,
-    bytes::complete::{escaped, tag, take_while, take_while1},
-    character::complete::{
-        alphanumeric1, char, multispace0, multispace1,
-        one_of, satisfy,
-    },
+    bytes::complete::{tag, take_while, take_while1},
+    character::complete::{char, multispace0, multispace1, satisfy},
     combinator::{all_consuming, cut, map, map_opt, opt, recognize, value},
     error::{context, make_error, ErrorKind, ParseError},
     multi::{separated_list0, separated_list1},
@@ -56,7 +53,8 @@ fn parse_comp_op<'a>(i: &'a str) -> IResult<&'a str, CompOp> {
 }
 
 fn parse_str<'a>(i: &'a str) -> IResult<&'a str, &'a str> {
-    escaped(alphanumeric1, '\\', one_of("\"n\\"))(i)
+    // FIXME: deal with escaped double quotes
+    take_while(|c| c != '"')(i)
 }
 
 fn parse_var_ref<'a>(i: &'a str) -> IResult<&'a str, &'a str> {
@@ -73,7 +71,10 @@ fn parse_name(i: &str) -> IResult<&str, &str> {
         is_name_start_char(c) || c == '-' || c.is_ascii_digit()
     }
 
-    recognize(pair(take_while1(is_name_start_char), take_while(is_name_char)))(i)
+    recognize(pair(
+        take_while1(is_name_start_char),
+        take_while(is_name_char),
+    ))(i)
 }
 
 fn boolean<'a>(input: &'a str) -> IResult<&'a str, bool> {
@@ -190,7 +191,9 @@ fn primary_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
         map(parse_array, Expr::Array),
         map(parse_literal, Expr::Literal),
         map(parse_var_ref, |s| Expr::VarRef(s.into())),
-        map(parse_fn_call, |(name, args)| Expr::FnCall((None, name.to_owned()), args))
+        map(parse_fn_call, |(name, args)| {
+            Expr::FnCall((None, name.to_owned()), args)
+        }),
     ))(i)
 }
 
@@ -345,6 +348,13 @@ mod tests {
     #[test]
     fn test_parse_str() {
         assert_eq!(parse_str("captains"), Ok(("", "captains")));
+        assert_eq!(parse_str("line1\\\nline2"), Ok(("", "line1\\\nline2")));
+        // FIXME
+        // assert_eq!(string("cap\\\"tains"), Ok(("", "cap\\\"tains")));
+    }
+    #[test]
+    fn test_string() {
+        assert_eq!(string("\"captains\""), Ok(("", "captains")));
     }
 
     #[test]
@@ -423,9 +433,13 @@ mod tests {
         );
         assert_eq!(
             parse_fn_call("string-length7 ( 1 , 2 )"),
-            Ok(("", ("string-length7", vec![
-                     Expr::Literal(json!(1.0)),
-                     Expr::Literal(json!(2.0))])))
+            Ok((
+                "",
+                (
+                    "string-length7",
+                    vec![Expr::Literal(json!(1.0)), Expr::Literal(json!(2.0))]
+                )
+            ))
         );
     }
 

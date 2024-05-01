@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::io::Write;
+use std::sync::Mutex;
 use std::vec;
 
 pub mod ast;
@@ -147,7 +148,13 @@ struct StaticContext {
 }
 
 // This will contain the available documents and node collections
-struct DynamicContext {}
+// In the future maybe this wants to contain some sort of interface that
+// talks to the correct kind of plugins
+struct DynamicContext {
+    /// The key is a file path.
+    /// In the future it shall also be possible to give a uri.
+    json_file_contents: Mutex<HashMap<String, Vec<Value>>>,
+}
 
 // BTreeMap feels a bit heavyweight, when we imagine that there will only
 // be around a dozen variables probably
@@ -162,6 +169,7 @@ fn forexp_to_iter<'a, 'ctx>(
     for_: &'a [(VarRef, Expr)],
     bindings: Bindings,
     ctx: &'ctx StaticContext,
+    dyn_ctx: &'ctx DynamicContext,
 ) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>> + 'a>
 where
     'ctx: 'a,
@@ -171,7 +179,7 @@ where
     }
     let (var_ref, exp) = &for_.first().unwrap();
 
-    match force_seq(exp, &bindings, ctx) {
+    match force_seq(exp, &bindings, ctx, dyn_ctx) {
         Ok(it) => {
             let bind_var = move |v: Value| {
                 // Create binding for the `for`
@@ -187,7 +195,7 @@ where
             } else {
                 let remaining = &for_[1..];
                 Box::new(it.map(bind_var).flat_map(|inner_bindings| {
-                    forexp_to_iter(remaining, inner_bindings, ctx)
+                    forexp_to_iter(remaining, inner_bindings, ctx, dyn_ctx)
                 }))
             }
         }
@@ -206,6 +214,7 @@ fn eval_query(
     expr: &Expr,
     bindings: &Bindings,
     ctx: &StaticContext,
+    dyn_ctx: &DynamicContext,
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For {
@@ -228,38 +237,47 @@ fn eval_query(
                 anyhow::bail!("Need for for now");
             }
 
-            let value_stream = forexp_to_iter(for_, bindings.clone(), ctx)
-                .map(|bindings_result| {
-                    let mut bindings = bindings_result?;
+            let value_stream =
+                forexp_to_iter(for_, bindings.clone(), ctx, dyn_ctx)
+                    .map(|bindings_result| {
+                        let mut bindings = bindings_result?;
 
-                    // Let bindings
-                    for let_binding in let_.iter() {
-                        // I think we have to assume at this point that
-                        // the the expressions have been checked
-                        let data = eval_expr(&let_binding.1, &bindings, ctx)?;
-                        bindings.insert(let_binding.0.ref_.to_owned(), data);
-                    }
-                    Ok(bindings)
-                })
-                .filter_map(|bindings_result| {
-                    let bindings = match bindings_result {
-                        Ok(bindings) => bindings,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    let get_cond_as_bool =
-                        || Ok(eval_expr(&where_, &bindings, ctx)?.try_into()?);
-                    match get_cond_as_bool() {
-                        Err(e) => return Some(Err(e)),
-                        Ok(false) => return None,
-                        // we fall through so that evaluation of return_ is
-                        // a bit separated from evaluation of where
-                        Ok(true) => {}
-                    }
-                    Some(eval_expr(&return_, &bindings, ctx))
-                })
-                .flat_map(data_result_to_value_results)
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter();
+                        // Let bindings
+                        for let_binding in let_.iter() {
+                            // I think we have to assume at this point that
+                            // the the expressions have been checked
+                            let data = eval_expr(
+                                &let_binding.1,
+                                &bindings,
+                                ctx,
+                                dyn_ctx,
+                            )?;
+                            bindings
+                                .insert(let_binding.0.ref_.to_owned(), data);
+                        }
+                        Ok(bindings)
+                    })
+                    .filter_map(|bindings_result| {
+                        let bindings = match bindings_result {
+                            Ok(bindings) => bindings,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let get_cond_as_bool = || {
+                            Ok(eval_expr(&where_, &bindings, ctx, dyn_ctx)?
+                                .try_into()?)
+                        };
+                        match get_cond_as_bool() {
+                            Err(e) => return Some(Err(e)),
+                            Ok(false) => return None,
+                            // we fall through so that evaluation of return_ is
+                            // a bit separated from evaluation of where
+                            Ok(true) => {}
+                        }
+                        Some(eval_expr(&return_, &bindings, ctx, dyn_ctx))
+                    })
+                    .flat_map(data_result_to_value_results)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter();
 
             Ok(Box::new(value_stream))
         }
@@ -288,22 +306,23 @@ fn force_seq(
     expr: &Expr,
     bindings: &Bindings,
     ctx: &StaticContext,
+    dyn_ctx: &DynamicContext,
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
-        Expr::For { .. } => eval_query(expr, bindings, ctx),
+        Expr::For { .. } => eval_query(expr, bindings, ctx, dyn_ctx),
         Expr::FnCall(_name, _args) => {
-            let data = eval_expr(expr, bindings, ctx)?;
+            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
             Ok(data_to_values(data))
         }
         Expr::Sequence(..) => {
-            let data = eval_expr(expr, bindings, ctx)?;
+            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
             match data {
                 Data::Sequence(seq) => Ok(seq.get_iter()),
                 _ => panic!("sequence did not evaluate to sequence"),
             }
         }
         Expr::Array(..) => {
-            let data = eval_expr(expr, bindings, ctx)?;
+            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
             match data {
                 // Array should always evaluate to array in the success case
                 Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
@@ -313,7 +332,7 @@ fn force_seq(
 
         // Atoms become sequences of length 1
         Expr::Comp(..) => {
-            let data = eval_expr(expr, bindings, ctx)?;
+            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
             match data {
                 Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
                 Data::EmptySequence => Ok(Box::new(None.into_iter())),
@@ -323,7 +342,7 @@ fn force_seq(
             }
         }
         Expr::ArrayUnbox(..) => {
-            let data = eval_expr(expr, bindings, ctx)?;
+            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
             Ok(data_to_values(data))
         }
         Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
@@ -348,6 +367,7 @@ fn eval_expr(
     expr: &Expr,
     bindings: &Bindings,
     ctx: &StaticContext,
+    dyn_ctx: &DynamicContext,
 ) -> anyhow::Result<Data> {
     match expr {
         // This shouldn't be the case
@@ -372,24 +392,24 @@ fn eval_expr(
             // we could reverse it?
             let mut evaluated_args: Vec<_> = args
                 .iter()
-                .map(|x| eval_expr(x, bindings, ctx))
+                .map(|x| eval_expr(x, bindings, ctx, dyn_ctx))
                 .collect::<Result<_, _>>()?;
 
             // Maybe we can learn to write macros an we'll end up writing
             // this as macro.
             match jfn {
-                JsoniqFn::Jfn1(f) => f(evaluated_args.remove(0)),
+                JsoniqFn::Jfn1(f) => f(dyn_ctx, evaluated_args.remove(0)),
                 JsoniqFn::Jfn2(f) => {
                     let arg1 = evaluated_args.remove(1);
                     let arg0 = evaluated_args.remove(0);
-                    f(arg0, arg1)
+                    f(dyn_ctx, arg0, arg1)
                 }
             }
         }
         Expr::Comp(CompOp::LT, lhs, rhs) => {
             // Or should we only evaluate rd if necessary?
-            let ld: Data = eval_expr(&*lhs, bindings, ctx)?.force();
-            let rd: Data = eval_expr(&*rhs, bindings, ctx)?.force();
+            let ld: Data = eval_expr(&*lhs, bindings, ctx, dyn_ctx)?.force();
+            let rd: Data = eval_expr(&*rhs, bindings, ctx, dyn_ctx)?.force();
             match (ld, rd) {
                 (Data::Sequence(..), _) | (_, Data::Sequence(..)) => {
                     Err(anyhow!("comparison on multivalued sequences"))
@@ -413,8 +433,8 @@ fn eval_expr(
             }
         }
         Expr::Comp(CompOp::EQ, lhs, rhs) => {
-            let _l: Data = eval_expr(&*lhs, bindings, ctx)?;
-            let _r: Data = eval_expr(&*rhs, bindings, ctx)?;
+            let _l: Data = eval_expr(&*lhs, bindings, ctx, dyn_ctx)?;
+            let _r: Data = eval_expr(&*rhs, bindings, ctx, dyn_ctx)?;
             // I think we actually just need to derive Equal to get this for
             // free... except for some sequence cases.
             todo!("EQ")
@@ -422,7 +442,7 @@ fn eval_expr(
         Expr::ArrayUnbox(subexp) => {
             // Array unboxing turns an array into a sequence
             // an any other kind of value into the empty sequence
-            let data = eval_expr(&subexp, bindings, ctx)?;
+            let data = eval_expr(&subexp, bindings, ctx, dyn_ctx)?;
 
             match data {
                 Data::Value(Value::Array(values)) => {
@@ -437,7 +457,7 @@ fn eval_expr(
 
             let evaluated: Vec<_> = exprs
                 .iter()
-                .map(|x| eval_expr(x, bindings, ctx))
+                .map(|x| eval_expr(x, bindings, ctx, dyn_ctx))
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
@@ -447,7 +467,7 @@ fn eval_expr(
             //  loop through exprs and evaluate each
             let evaluated: Vec<Value> = exprs
                 .iter()
-                .map(|x| eval_expr(x, bindings, ctx))
+                .map(|x| eval_expr(x, bindings, ctx, dyn_ctx))
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
@@ -462,8 +482,8 @@ fn eval_expr(
 }
 
 enum JsoniqFn {
-    Jfn1(fn(Data) -> anyhow::Result<Data>),
-    Jfn2(fn(Data, Data) -> anyhow::Result<Data>),
+    Jfn1(fn(&DynamicContext, Data) -> anyhow::Result<Data>),
+    Jfn2(fn(&DynamicContext, Data, Data) -> anyhow::Result<Data>),
 }
 
 impl JsoniqFn {
@@ -477,6 +497,11 @@ impl JsoniqFn {
 
 /// The builtin function library
 mod jfn {
+    use std::{
+        fs::File,
+        io::{BufRead, BufReader},
+    };
+
     use super::*;
 
     /// Casts it's arguments to strings and concatenates them.
@@ -485,7 +510,11 @@ mod jfn {
     ///
     ///   fn:concat('Ciao!',()) -> "Ciao!"
     ///   fn:concat('un', 'grateful') -> "ungrateful"
-    pub fn concat(a1: Data, a2: Data) -> anyhow::Result<Data> {
+    pub fn concat(
+        _dyn_ctx: &DynamicContext,
+        a1: Data,
+        a2: Data,
+    ) -> anyhow::Result<Data> {
         let to_str = |d: Data| match d.force() {
             Data::Sequence(..) => {
                 Err(anyhow!("concat on multivalued sequence"))
@@ -498,9 +527,46 @@ mod jfn {
         Ok(Data::Value(Value::String(s1 + &s2)))
     }
 
-    // collection("captains")
-    pub fn collection(_uri: Data) -> anyhow::Result<Data> {
-        todo!("collection")
+    // Maybe we can end up writing some macros that validate / convert
+    // the arguments...
+
+    // json-file("captains.json")
+    pub fn json_file(
+        dyn_ctx: &DynamicContext,
+        uri: Data,
+    ) -> anyhow::Result<Data> {
+        let to_str = |d: Data| match d.force() {
+            Data::Sequence(..) => Err(anyhow!(
+                "json-file with multivalued sequence, wanted string"
+            )),
+            Data::Value(v) => cast_json_to_string(v),
+            Data::EmptySequence => Err(anyhow!(
+                "json-file called with with empty sequence, wanted string"
+            )),
+        };
+        let file_path = to_str(uri)?;
+        let fp_str = file_path.as_str();
+
+        let to_vec_seq =
+            |values| Ok(Data::Sequence(Sequence::VecBackend(values)));
+
+        let mut json_file_contents = dyn_ctx.json_file_contents.lock().unwrap();
+
+        let Some(values) = json_file_contents.get(file_path.as_str()) else {
+            let file = File::open(fp_str)?;
+            let reader = BufReader::new(file);
+            let mut values = Vec::new();
+            for line in reader.lines() {
+                let v: Value = serde_json::from_str(line?.as_str())?;
+                values.push(v);
+            }
+            json_file_contents.insert(fp_str.to_owned(), values.clone());
+            return to_vec_seq(values);
+        };
+
+        // TODO: we should have a backend that just refers to the values
+        // in the map... instead of cloning...
+        to_vec_seq(values.clone())
     }
 }
 
@@ -509,7 +575,7 @@ type FnTable = HashMap<&'static str, JsoniqFn>;
 fn base_fn_library() -> FnTable {
     HashMap::from([
         ("concat", JsoniqFn::Jfn2(jfn::concat)),
-        ("collection", JsoniqFn::Jfn1(jfn::collection)),
+        ("json-file", JsoniqFn::Jfn1(jfn::json_file)),
     ])
 }
 
@@ -525,8 +591,12 @@ pub fn run_program<W: Write>(program: &str, mut out: W) -> anyhow::Result<()> {
         functions: base_fn_library(),
     };
 
+    let dyn_ctx = DynamicContext {
+        json_file_contents: Mutex::new(HashMap::new()),
+    };
+
     let bindings = Bindings::new();
-    eval_query(&expr, &bindings, &ctx)?
+    eval_query(&expr, &bindings, &ctx, &dyn_ctx)?
         .try_for_each(|value| writeln!(out, "{value}"))?;
 
     Ok(())
@@ -542,6 +612,9 @@ mod tests {
         let ctx = StaticContext {
             functions: base_fn_library(),
         };
+        let mut dyn_ctx = DynamicContext {
+            json_file_contents: HashMap::new().into(),
+        };
         let source_x = Expr::Sequence(vec![
             Expr::Literal(json!(1.0)),
             Expr::Literal(json!(2.0)),
@@ -554,7 +627,7 @@ mod tests {
         let fors_: Vec<(VarRef, Expr)> =
             vec![("x".into(), source_x), ("y".into(), source_y)];
 
-        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx);
+        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx, &mut dyn_ctx);
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {
@@ -590,6 +663,9 @@ mod tests {
         let ctx = StaticContext {
             functions: base_fn_library(),
         };
+        let mut dyn_ctx = DynamicContext {
+            json_file_contents: HashMap::new().into(),
+        };
         let source_x = Expr::Sequence(vec![
             Expr::Literal(json!([1.0, 2.0])),
             Expr::Literal(json!([3.0, 4.0])),
@@ -603,7 +679,7 @@ mod tests {
             ),
         ];
 
-        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx);
+        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx, &mut dyn_ctx);
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {

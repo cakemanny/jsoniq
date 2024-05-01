@@ -7,10 +7,13 @@ use std::process;
 use jsoniq::run_program;
 
 fn print_usage(mut w: impl Write) -> Result<(), Box<dyn std::error::Error>> {
-    writeln!(w, "jsoniq")?;
-    writeln!(w)?;
-    writeln!(w, "usage: jsoniq [options] <jsoniq expression>")?;
-    writeln!(w)?;
+    writeln!(w, r#"jsoniq
+
+Usage: jsoniq [options] <jsoniq expression>
+
+Options:
+  -r    start a repl
+"#)?;
     Ok(())
 }
 
