@@ -152,7 +152,8 @@ struct StaticContext {
 // This will contain the available documents and node collections
 // In the future maybe this wants to contain some sort of interface that
 // talks to the correct kind of plugins
-struct DynamicContext {
+struct DynamicContext <'a> {
+    stat_ctx: &'a StaticContext,
     /// The key is a file path.
     /// In the future it shall also be possible to give a uri.
     json_file_contents: Mutex<HashMap<String, Vec<Value>>>,
@@ -170,8 +171,7 @@ type Bindings = BTreeMap<String, Data>;
 fn forexp_to_iter<'a, 'ctx>(
     for_: &'a [(VarRef, Expr)],
     bindings: Bindings,
-    ctx: &'ctx StaticContext,
-    dyn_ctx: &'ctx DynamicContext,
+    ctx: &'ctx DynamicContext,
 ) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>> + 'a>
 where
     'ctx: 'a,
@@ -181,7 +181,7 @@ where
     }
     let (var_ref, exp) = &for_.first().unwrap();
 
-    match force_seq(exp, &bindings, ctx, dyn_ctx) {
+    match force_seq(exp, &bindings, ctx) {
         Ok(it) => {
             let bind_var = move |v: Value| {
                 // Create binding for the `for`
@@ -197,7 +197,7 @@ where
             } else {
                 let remaining = &for_[1..];
                 Box::new(it.map(bind_var).flat_map(|inner_bindings| {
-                    forexp_to_iter(remaining, inner_bindings, ctx, dyn_ctx)
+                    forexp_to_iter(remaining, inner_bindings, ctx)
                 }))
             }
         }
@@ -215,8 +215,7 @@ where
 fn eval_query(
     expr: &Expr,
     bindings: &Bindings,
-    ctx: &StaticContext,
-    dyn_ctx: &DynamicContext,
+    ctx: &DynamicContext,
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For {
@@ -240,7 +239,7 @@ fn eval_query(
             }
 
             let value_stream =
-                forexp_to_iter(for_, bindings.clone(), ctx, dyn_ctx)
+                forexp_to_iter(for_, bindings.clone(), ctx)
                     .map(|bindings_result| {
                         let mut bindings = bindings_result?;
 
@@ -252,7 +251,6 @@ fn eval_query(
                                 &let_binding.1,
                                 &bindings,
                                 ctx,
-                                dyn_ctx,
                             )?;
                             bindings
                                 .insert(let_binding.0.ref_.to_owned(), data);
@@ -265,7 +263,7 @@ fn eval_query(
                             Err(e) => return Some(Err(e)),
                         };
                         let get_cond_as_bool = || {
-                            Ok(eval_expr(&where_, &bindings, ctx, dyn_ctx)?
+                            Ok(eval_expr(&where_, &bindings, ctx)?
                                 .try_into()?)
                         };
                         match get_cond_as_bool() {
@@ -275,7 +273,7 @@ fn eval_query(
                             // a bit separated from evaluation of where
                             Ok(true) => {}
                         }
-                        Some(eval_expr(&return_, &bindings, ctx, dyn_ctx))
+                        Some(eval_expr(&return_, &bindings, ctx))
                     })
                     .flat_map(data_result_to_value_results)
                     .collect::<Result<Vec<_>, _>>()?
@@ -307,24 +305,23 @@ fn data_result_to_value_results(
 fn force_seq(
     expr: &Expr,
     bindings: &Bindings,
-    ctx: &StaticContext,
-    dyn_ctx: &DynamicContext,
+    ctx: &DynamicContext,
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
-        Expr::For { .. } => eval_query(expr, bindings, ctx, dyn_ctx),
+        Expr::For { .. } => eval_query(expr, bindings, ctx),
         Expr::FnCall(_, _) | Expr::ObjectLookup(_, _) => {
-            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             Ok(data_to_values(data))
         }
         Expr::Sequence(..) => {
-            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             match data {
                 Data::Sequence(seq) => Ok(seq.get_iter()),
                 _ => panic!("sequence did not evaluate to sequence"),
             }
         }
         Expr::Array(..) => {
-            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             match data {
                 // Array should always evaluate to array in the success case
                 Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
@@ -333,7 +330,7 @@ fn force_seq(
         }
         // Atoms become sequences of length 1
         Expr::Comp(..) => {
-            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             match data {
                 Data::Value(v) => Ok(Box::new(Some(v).into_iter())),
                 Data::EmptySequence => Ok(Box::new(None.into_iter())),
@@ -343,7 +340,7 @@ fn force_seq(
             }
         }
         Expr::ArrayUnbox(..) => {
-            let data = eval_expr(expr, bindings, ctx, dyn_ctx)?;
+            let data = eval_expr(expr, bindings, ctx)?;
             Ok(data_to_values(data))
         }
         Expr::Literal(atom) => Ok(Box::new(Some(atom.clone()).into_iter())),
@@ -367,8 +364,7 @@ fn force_seq(
 fn eval_expr(
     expr: &Expr,
     bindings: &Bindings,
-    ctx: &StaticContext,
-    dyn_ctx: &DynamicContext,
+    ctx: &DynamicContext,
 ) -> anyhow::Result<Data> {
     match expr {
         // This shouldn't be the case
@@ -378,7 +374,7 @@ fn eval_expr(
         Expr::FnCall((_nsopt, name), args) => {
             // We should define a static pass that checks this before
             // execution.
-            let Some(jfn) = ctx.functions.get(name.as_str()) else {
+            let Some(jfn) = ctx.stat_ctx.functions.get(name.as_str()) else {
                 bail!("no such function: {}", name);
             };
             if args.len() != jfn.num_args() {
@@ -393,24 +389,24 @@ fn eval_expr(
             // we could reverse it?
             let mut evaluated_args: Vec<_> = args
                 .iter()
-                .map(|x| eval_expr(x, bindings, ctx, dyn_ctx))
+                .map(|x| eval_expr(x, bindings, ctx))
                 .collect::<Result<_, _>>()?;
 
             // Maybe we can learn to write macros an we'll end up writing
             // this as macro.
             match jfn {
-                JsoniqFn::Jfn1(f) => f(dyn_ctx, evaluated_args.remove(0)),
+                JsoniqFn::Jfn1(f) => f(ctx, evaluated_args.remove(0)),
                 JsoniqFn::Jfn2(f) => {
                     let arg1 = evaluated_args.remove(1);
                     let arg0 = evaluated_args.remove(0);
-                    f(dyn_ctx, arg0, arg1)
+                    f(ctx, arg0, arg1)
                 }
             }
         }
         Expr::Comp(CompOp::LT, lhs, rhs) => {
             // Or should we only evaluate rd if necessary?
-            let ld: Data = eval_expr(&*lhs, bindings, ctx, dyn_ctx)?.force();
-            let rd: Data = eval_expr(&*rhs, bindings, ctx, dyn_ctx)?.force();
+            let ld: Data = eval_expr(&*lhs, bindings, ctx)?.force();
+            let rd: Data = eval_expr(&*rhs, bindings, ctx)?.force();
             match (ld, rd) {
                 (Data::Sequence(..), _) | (_, Data::Sequence(..)) => {
                     Err(anyhow!("comparison on multivalued sequences"))
@@ -434,8 +430,8 @@ fn eval_expr(
             }
         }
         Expr::Comp(CompOp::EQ, lhs, rhs) => {
-            let _l: Data = eval_expr(&*lhs, bindings, ctx, dyn_ctx)?;
-            let _r: Data = eval_expr(&*rhs, bindings, ctx, dyn_ctx)?;
+            let _l: Data = eval_expr(&*lhs, bindings, ctx)?;
+            let _r: Data = eval_expr(&*rhs, bindings, ctx)?;
             // I think we actually just need to derive Equal to get this for
             // free... except for some sequence cases.
             todo!("EQ")
@@ -443,7 +439,7 @@ fn eval_expr(
         Expr::ArrayUnbox(subexp) => {
             // Array unboxing turns an array into a sequence
             // and any other kind of value into the empty sequence
-            let data = eval_expr(&subexp, bindings, ctx, dyn_ctx)?;
+            let data = eval_expr(&subexp, bindings, ctx)?;
 
             match data {
                 Data::Value(Value::Array(values)) => {
@@ -454,7 +450,7 @@ fn eval_expr(
         }
         Expr::ObjectLookup(obj_exp, lookup_exp) => {
             let lookup_data =
-                eval_expr(lookup_exp, bindings, ctx, dyn_ctx)?.force();
+                eval_expr(lookup_exp, bindings, ctx)?.force();
             let lookup = match lookup_data {
                 Data::Sequence(..) | Data::EmptySequence => {
                     return Err(anyhow!(
@@ -464,7 +460,7 @@ fn eval_expr(
                 Data::Value(v) => cast_json_to_string(v)?,
             };
 
-            let obj = eval_expr(&obj_exp, bindings, ctx, dyn_ctx)?;
+            let obj = eval_expr(&obj_exp, bindings, ctx)?;
 
             let perform_lookup = |value| match value {
                 Value::Object(m) => {
@@ -498,7 +494,7 @@ fn eval_expr(
 
             let evaluated: Vec<_> = exprs
                 .iter()
-                .map(|x| eval_expr(x, bindings, ctx, dyn_ctx))
+                .map(|x| eval_expr(x, bindings, ctx))
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
@@ -508,7 +504,7 @@ fn eval_expr(
             //  loop through exprs and evaluate each
             let evaluated: Vec<Value> = exprs
                 .iter()
-                .map(|x| eval_expr(x, bindings, ctx, dyn_ctx))
+                .map(|x| eval_expr(x, bindings, ctx))
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<_, _>>()?;
 
@@ -573,7 +569,7 @@ mod jfn {
 
     // json-file("captains.json")
     pub fn json_file(
-        dyn_ctx: &DynamicContext,
+        ctx: &DynamicContext,
         uri: Data,
     ) -> anyhow::Result<Data> {
         let to_str = |d: Data| match d.force() {
@@ -591,7 +587,7 @@ mod jfn {
         let to_vec_seq =
             |values| Ok(Data::Sequence(Sequence::VecBackend(values)));
 
-        let mut json_file_contents = dyn_ctx.json_file_contents.lock().unwrap();
+        let mut json_file_contents = ctx.json_file_contents.lock().unwrap();
 
         let Some(values) = json_file_contents.get(file_path.as_str()) else {
             let file = File::open(fp_str)?;
@@ -624,20 +620,16 @@ pub fn run_program<W: Write>(program: &str, mut out: W) -> anyhow::Result<()> {
     let (_, expr) = parse::parse_main_module(program)
         .map_err(|e| anyhow::Error::new(e.to_owned()))?;
 
-    // TODO: next
-    // - Try to implement the collection function call. This may mean extending
-    // our functions to take a dynamic context parameter.
-
-    let ctx = StaticContext {
+    let static_ctx = StaticContext {
         functions: base_fn_library(),
     };
-
-    let dyn_ctx = DynamicContext {
+    let ctx = DynamicContext {
+        stat_ctx: &static_ctx,
         json_file_contents: Mutex::new(HashMap::new()),
     };
 
     let bindings = Bindings::new();
-    eval_query(&expr, &bindings, &ctx, &dyn_ctx)?
+    eval_query(&expr, &bindings, &ctx)?
         .try_for_each(|value| writeln!(out, "{value}"))?;
 
     Ok(())
@@ -650,10 +642,11 @@ mod tests {
 
     #[test]
     fn combine_two_for_expressions() {
-        let ctx = StaticContext {
+        let static_ctx = StaticContext {
             functions: base_fn_library(),
         };
-        let mut dyn_ctx = DynamicContext {
+        let ctx = DynamicContext {
+            stat_ctx: &static_ctx,
             json_file_contents: HashMap::new().into(),
         };
         let source_x = Expr::Sequence(vec![
@@ -668,7 +661,7 @@ mod tests {
         let fors_: Vec<(VarRef, Expr)> =
             vec![("x".into(), source_x), ("y".into(), source_y)];
 
-        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx, &mut dyn_ctx);
+        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx);
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {
@@ -701,10 +694,11 @@ mod tests {
 
     #[test]
     fn for_expansion_sub_iteration() {
-        let ctx = StaticContext {
+        let static_ctx = StaticContext {
             functions: base_fn_library(),
         };
-        let mut dyn_ctx = DynamicContext {
+        let ctx = DynamicContext {
+            stat_ctx: &static_ctx,
             json_file_contents: HashMap::new().into(),
         };
         let source_x = Expr::Sequence(vec![
@@ -720,7 +714,7 @@ mod tests {
             ),
         ];
 
-        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx, &mut dyn_ctx);
+        let it = forexp_to_iter(&fors_, BTreeMap::new(), &ctx);
         let res: Vec<(Option<Value>, Option<Value>)> = it
             .map(|bindings_result| {
                 bindings_result.map(|bindings| {
