@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::fmt::Debug;
 use std::io::Write;
 use std::sync::Mutex;
@@ -77,17 +78,11 @@ impl Data {
 
 // we have to implement Debug manually due to the Rc
 impl Debug for Data {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Data::Sequence(_rc) => {
-                write!(f, "Sequence[..]")
-            }
-            Data::EmptySequence => {
-                write!(f, "EmptySequence[..]")
-            }
-            Data::Value(v) => {
-                write!(f, "Value[{}]", v)
-            }
+            Data::Sequence(_rc) => write!(f, "Sequence[..]"),
+            Data::EmptySequence => write!(f, "EmptySequence[..]"),
+            Data::Value(v) => write!(f, "Value[{}]", v),
         }
     }
 }
@@ -152,8 +147,8 @@ struct StaticContext {
 // This will contain the available documents and node collections
 // In the future maybe this wants to contain some sort of interface that
 // talks to the correct kind of plugins
-struct DynamicContext <'a> {
-    stat_ctx: &'a StaticContext,
+struct DynamicContext {
+    stat_ctx: StaticContext,
     /// The key is a file path.
     /// In the future it shall also be possible to give a uri.
     json_file_contents: Mutex<HashMap<String, Vec<Value>>>,
@@ -238,46 +233,38 @@ fn eval_query(
                 anyhow::bail!("Need for for now");
             }
 
-            let value_stream =
-                forexp_to_iter(for_, bindings.clone(), ctx)
-                    .map(|bindings_result| {
-                        let mut bindings = bindings_result?;
+            let value_stream = forexp_to_iter(for_, bindings.clone(), ctx)
+                .map(|bindings_result| {
+                    let mut bindings = bindings_result?;
 
-                        // Let bindings
-                        for let_binding in let_.iter() {
-                            // I think we have to assume at this point that
-                            // the the expressions have been checked
-                            let data = eval_expr(
-                                &let_binding.1,
-                                &bindings,
-                                ctx,
-                            )?;
-                            bindings
-                                .insert(let_binding.0.ref_.to_owned(), data);
-                        }
-                        Ok(bindings)
-                    })
-                    .filter_map(|bindings_result| {
-                        let bindings = match bindings_result {
-                            Ok(bindings) => bindings,
-                            Err(e) => return Some(Err(e)),
-                        };
-                        let get_cond_as_bool = || {
-                            Ok(eval_expr(&where_, &bindings, ctx)?
-                                .try_into()?)
-                        };
-                        match get_cond_as_bool() {
-                            Err(e) => return Some(Err(e)),
-                            Ok(false) => return None,
-                            // we fall through so that evaluation of return_ is
-                            // a bit separated from evaluation of where
-                            Ok(true) => {}
-                        }
-                        Some(eval_expr(&return_, &bindings, ctx))
-                    })
-                    .flat_map(data_result_to_value_results)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter();
+                    // Let bindings
+                    for let_binding in let_.iter() {
+                        // I think we have to assume at this point that
+                        // the the expressions have been checked
+                        let data = eval_expr(&let_binding.1, &bindings, ctx)?;
+                        bindings.insert(let_binding.0.ref_.to_owned(), data);
+                    }
+                    Ok(bindings)
+                })
+                .filter_map(|bindings_result| {
+                    let bindings = match bindings_result {
+                        Ok(bindings) => bindings,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let get_cond_as_bool =
+                        || Ok(eval_expr(&where_, &bindings, ctx)?.try_into()?);
+                    match get_cond_as_bool() {
+                        Err(e) => return Some(Err(e)),
+                        Ok(false) => return None,
+                        // we fall through so that evaluation of return_ is
+                        // a bit separated from evaluation of where
+                        Ok(true) => {}
+                    }
+                    Some(eval_expr(&return_, &bindings, ctx))
+                })
+                .flat_map(data_result_to_value_results)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter();
 
             Ok(Box::new(value_stream))
         }
@@ -309,7 +296,7 @@ fn force_seq(
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
         Expr::For { .. } => eval_query(expr, bindings, ctx),
-        Expr::FnCall(_, _) | Expr::ObjectLookup(_, _) => {
+        Expr::FnCall(..) | Expr::ObjectLookup { .. } => {
             let data = eval_expr(expr, bindings, ctx)?;
             Ok(data_to_values(data))
         }
@@ -448,9 +435,11 @@ fn eval_expr(
                 _ => Ok(Data::EmptySequence),
             }
         }
-        Expr::ObjectLookup(obj_exp, lookup_exp) => {
-            let lookup_data =
-                eval_expr(lookup_exp, bindings, ctx)?.force();
+        Expr::ObjectLookup {
+            obj: obj_exp,
+            lookup: lookup_exp,
+        } => {
+            let lookup_data = eval_expr(lookup_exp, bindings, ctx)?.force();
             let lookup = match lookup_data {
                 Data::Sequence(..) | Data::EmptySequence => {
                     return Err(anyhow!(
@@ -518,6 +507,248 @@ fn eval_expr(
     }
 }
 
+struct Scope<'a> {
+    parent_scope: Option<&'a Scope<'a>>,
+    names: BTreeSet<String>,
+    // todo: type ?
+}
+impl Scope<'_> {
+    fn new() -> Scope<'static> {
+        Scope {
+            parent_scope: None,
+            names: BTreeSet::new(),
+        }
+    }
+}
+impl Scope<'_> {
+    fn with_parent<'a>(parent: &'a Scope) -> Scope<'a> {
+        Scope {
+            parent_scope: Some(parent),
+            names: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ValidationError {
+    NoSuchFunction(String),
+    IncorrectNumArgs {
+        func: String,
+        expected: usize,
+        given: usize,
+    },
+    NoSuchVariable(String),
+    Multiple {
+        errs: Vec<ValidationError>,
+    },
+}
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSuchFunction(func) => {
+                write!(f, "no such function: {}", func)
+            }
+            Self::IncorrectNumArgs {
+                func,
+                expected,
+                given,
+            } => write!(
+                f,
+                "function {} expects {} arguments but {} were given",
+                func, expected, given
+            ),
+            Self::NoSuchVariable(name) => {
+                write!(f, "no variable ${} in scope", name)
+            }
+            Self::Multiple { errs } => {
+                for err in errs.iter() {
+                    write!(f, "{}\n", err)?
+                }
+                Ok(())
+            }
+        }
+    }
+}
+impl std::error::Error for ValidationError {}
+
+/// combines multiple errors together
+macro_rules! check_multi {
+    ($fst:expr, $snd:expr) => {
+        match ($fst, $snd) {
+            (Err(lhs), Err(rhs)) => {
+                return Err(ValidationError::Multiple {
+                    errs: vec![lhs, rhs],
+                })
+            }
+            (Err(lhs), _) => return Err(lhs),
+            (_, Err(rhs)) => return Err(rhs),
+            (Ok(l), Ok(r)) => (l, r),
+        }
+    };
+}
+
+// one idea could be to return some sort of slightly transformed expression
+// tree. e.g. a typed one or deduce contraints etc like max number of
+// variables / ...
+fn check_expr(
+    expr: parse::Expr,
+    scope: &Scope,
+    ctx: &StaticContext,
+) -> Result<Expr, ValidationError> {
+    type E = ValidationError;
+
+    match expr {
+        parse::Expr::For {
+            for_,
+            let_,
+            where_,
+            order,
+            return_,
+        } => {
+            // We work a bit non-functionaly in the sense that we are
+            // mutating the scope as we work through the expression in
+            // evaluation order.
+            let mut new_scope = Scope::with_parent(scope);
+
+            let checked_for = for_.into_iter().try_fold(
+                Vec::new(),
+                |mut acc, (var, expr)| {
+                    let checked = check_expr(expr, &new_scope, ctx)?;
+                    // When we do typing, this is where the difference between for
+                    // and let below would show themselves. As the type of the
+                    // bound variable in a for is the type of the sequence elements
+                    // when the expression is a sequence...
+
+                    new_scope.names.insert(var.ref_.clone());
+                    acc.push((var.into(), checked));
+                    Ok::<_, E>(acc)
+                },
+            )?;
+            let checked_let = let_.into_iter().try_fold(
+                Vec::new(),
+                |mut acc, (var, expr)| {
+                    let checked = check_expr(expr, &new_scope, ctx)?;
+                    new_scope.names.insert(var.ref_.clone());
+                    acc.push((var.into(), checked));
+                    Ok::<_, E>(acc)
+                },
+            )?;
+            let checked_where = Box::new(check_expr(*where_, &new_scope, ctx)?);
+            // since order doesn't introduce any bindings it would definitely
+            // be possible to check each part of the order clause individually
+            // when we come to that.
+            let checked_order = order
+                .into_iter()
+                .map(|(term, ord)| {
+                    let checked_term = check_expr(term, &new_scope, ctx)?;
+                    Ok::<_, E>((checked_term, ord.into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let checked_return =
+                Box::new(check_expr(*return_, &new_scope, ctx)?);
+
+            Ok(Expr::For {
+                for_: checked_for,
+                let_: checked_let,
+                where_: checked_where,
+                order: checked_order,
+                return_: checked_return,
+            })
+        }
+        parse::Expr::FnCall((ns, name), args) => {
+            let Some(jfn) = ctx.functions.get(name.as_str()) else {
+                // TODO: consider doing a fuzzy search?
+                return Err(ValidationError::NoSuchFunction(name));
+            };
+            if args.len() != jfn.num_args() {
+                return Err(ValidationError::IncorrectNumArgs {
+                    func: name,
+                    expected: jfn.num_args(),
+                    given: args.len(),
+                });
+            }
+            // TODO: consider having arg type specs where appropriate?
+
+            let checked_args: Vec<_> = args
+                .into_iter()
+                .map(|arg| check_expr(arg, scope, ctx))
+                .collect::<Result<_, _>>()?;
+
+            Ok(Expr::FnCall((ns, name), checked_args))
+        }
+        parse::Expr::Comp(op, lhs, rhs) => {
+            // TODO: if we can know the type and know that they are not
+            // compatible then we can already return an error
+            let (l, r) = check_multi!(
+                check_expr(*lhs, scope, ctx),
+                check_expr(*rhs, scope, ctx)
+            );
+            Ok(Expr::Comp(op.into(), Box::new(l), Box::new(r)))
+        }
+        parse::Expr::ArrayUnbox(expr) => {
+            // Array unbox just returns an empty sequence when the expression
+            // type doesn't match. So we do nothing special here.
+            let expr = check_expr(*expr, scope, ctx)?;
+            Ok(Expr::ArrayUnbox(Box::new(expr)))
+        }
+        parse::Expr::ObjectLookup { obj, lookup } => {
+            let obj = check_expr(*obj, scope, ctx);
+            let lookup = check_expr(*lookup, scope, ctx);
+            let (obj, lookup) = check_multi!(obj, lookup);
+            Ok(Expr::ObjectLookup {
+                obj: Box::new(obj),
+                lookup: Box::new(lookup),
+            })
+        }
+        parse::Expr::Sequence(exprs) => {
+            // TODO: try to write this in a 1. more functional 2. more generic
+            // way
+            let mut errs = Vec::new();
+            let mut checked = Vec::new();
+            for expr in exprs.into_iter() {
+                match check_expr(expr, scope, ctx) {
+                    Err(e) => errs.push(e),
+                    Ok(expr) => checked.push(expr),
+                }
+            }
+            match &*errs {
+                [] => Ok(Expr::Sequence(checked)),
+                [_one_err] => Err(errs.pop().unwrap()),
+                _ => Err(E::Multiple { errs }),
+            }
+        }
+        parse::Expr::Array(exprs) => {
+            // TODO: factor this with Sequence
+            let mut errs = Vec::new();
+            let mut checked = Vec::new();
+            for expr in exprs.into_iter() {
+                match check_expr(expr, scope, ctx) {
+                    Err(e) => errs.push(e),
+                    Ok(expr) => checked.push(expr),
+                }
+            }
+            match &*errs {
+                [] => Ok(Expr::Array(checked)),
+                [_one_err] => Err(errs.pop().unwrap()),
+                _ => Err(E::Multiple { errs }),
+            }
+        }
+        parse::Expr::Literal(v) => Ok(Expr::Literal(v)),
+        parse::Expr::VarRef(var_ref) => {
+            let mut maybe_scope = Some(scope);
+            while maybe_scope.is_some() {
+                let s = maybe_scope.unwrap();
+                if s.names.contains(var_ref.ref_.as_str()) {
+                    return Ok(Expr::VarRef(var_ref.into()));
+                }
+                maybe_scope = s.parent_scope;
+            }
+            Err(E::NoSuchVariable(var_ref.ref_.to_string()))
+        }
+    }
+}
+
 enum JsoniqFn {
     Jfn1(fn(&DynamicContext, Data) -> anyhow::Result<Data>),
     Jfn2(fn(&DynamicContext, Data, Data) -> anyhow::Result<Data>),
@@ -538,6 +769,8 @@ mod jfn {
         fs::File,
         io::{BufRead, BufReader},
     };
+
+    use anyhow::Context;
 
     use super::*;
 
@@ -568,10 +801,7 @@ mod jfn {
     // the arguments...
 
     // json-file("captains.json")
-    pub fn json_file(
-        ctx: &DynamicContext,
-        uri: Data,
-    ) -> anyhow::Result<Data> {
+    pub fn json_file(ctx: &DynamicContext, uri: Data) -> anyhow::Result<Data> {
         let to_str = |d: Data| match d.force() {
             Data::Sequence(..) => Err(anyhow!(
                 "json-file with multivalued sequence, wanted string"
@@ -590,7 +820,9 @@ mod jfn {
         let mut json_file_contents = ctx.json_file_contents.lock().unwrap();
 
         let Some(values) = json_file_contents.get(file_path.as_str()) else {
-            let file = File::open(fp_str)?;
+            let file = File::open(fp_str).with_context(|| {
+                format!("Failed to read json from {}", fp_str)
+            })?;
             let reader = BufReader::new(file);
             let mut values = Vec::new();
             for line in reader.lines() {
@@ -623,8 +855,15 @@ pub fn run_program<W: Write>(program: &str, mut out: W) -> anyhow::Result<()> {
     let static_ctx = StaticContext {
         functions: base_fn_library(),
     };
+
+    // There could now be a type checking phase that references static
+    // context.
+
+    let scope_chain = Scope::new();
+    let expr = check_expr(expr, &scope_chain, &static_ctx)?;
+
     let ctx = DynamicContext {
-        stat_ctx: &static_ctx,
+        stat_ctx: static_ctx,
         json_file_contents: Mutex::new(HashMap::new()),
     };
 
@@ -646,7 +885,7 @@ mod tests {
             functions: base_fn_library(),
         };
         let ctx = DynamicContext {
-            stat_ctx: &static_ctx,
+            stat_ctx: static_ctx,
             json_file_contents: HashMap::new().into(),
         };
         let source_x = Expr::Sequence(vec![
@@ -698,7 +937,7 @@ mod tests {
             functions: base_fn_library(),
         };
         let ctx = DynamicContext {
-            stat_ctx: &static_ctx,
+            stat_ctx: static_ctx,
             json_file_contents: HashMap::new().into(),
         };
         let source_x = Expr::Sequence(vec![
