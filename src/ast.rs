@@ -53,13 +53,19 @@ impl From<&str> for VarRef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum FLWORClause {
+    // TODO: simplify so that these don't contain Vecs
+    For(Vec<(VarRef, Expr)>), // for $x in collection("captains")
+    Let(Vec<(VarRef, Expr)>), // let $century := $x.century
+    Where(Box<Expr>),         // where $x.name eq "Kathryn Janeway"
+    Order(Vec<(Expr, Ordering)>), // order by $x.name
+                              // TODO GroupBy
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     For {
-        for_: Vec<(VarRef, Expr)>, // for $x in collection("captains")
-        let_: Vec<(VarRef, Expr)>, // let $century := $x.century
-        where_: Box<Expr>,         // where $x.name eq "Kathryn Janeway"
-        order: Vec<(Expr, Ordering)>, // order by $x.name
-        // TODO: group_by
+        clauses: Vec<FLWORClause>,
         return_: Box<Expr>, // return $x
     },
     // TODO: consider expanding these to fixed size known calls when possible?

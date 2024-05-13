@@ -1,7 +1,6 @@
 //
 // Reference Grammar: https://www.jsoniq.org/grammars/jsoniq.xhtml
 //
-use std::vec;
 
 use nom::{
     branch::alt,
@@ -9,12 +8,12 @@ use nom::{
     character::complete::{char, multispace0, multispace1, satisfy},
     combinator::{all_consuming, cut, map, map_opt, opt, recognize, value},
     error::{context, make_error, ErrorKind, ParseError},
-    multi::{separated_list0, separated_list1},
+    multi::{many0, separated_list0, separated_list1},
     number::complete::double,
     sequence::{delimited, pair, preceded, terminated, tuple},
     AsChar, Err, IResult, Parser,
 };
-use serde_json::{json, Number, Value};
+use serde_json::{Number, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompOp {
@@ -44,28 +43,35 @@ impl From<&str> for VarRef {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum FLWORClause {
+    For(Vec<(VarRef, Expr)>), // for $x in collection("captains")
+    Let(Vec<(VarRef, Expr)>), // let $century := $x.century
+    Where(Box<Expr>),         // where $x.name eq "Kathryn Janeway"
+    Order(Vec<(Expr, Ordering)>), // order by $x.name
+                              // TODO GroupBy
+}
+
 // TODO: include input position in here... or rebuild it out of tokens
-#[derive(Debug, Clone, PartialEq)] // not sure what the PartialEq is about...
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     For {
-        for_: Vec<(VarRef, Expr)>, // for $x in collection("captains")
-        let_: Vec<(VarRef, Expr)>, // let $century := $x.century
-        where_: Box<Expr>,         // where $x.name eq "Kathryn Janeway"
-        order: Vec<(Expr, Ordering)>, // order by $x.name
-        // TODO: group_by
+        clauses: Vec<FLWORClause>,
         return_: Box<Expr>, // return $x
     },
     FnCall(QName, Vec<Expr>), // fn:concat("1","2")
     Comp(CompOp, Box<Expr>, Box<Expr>),
     ArrayUnbox(Box<Expr>),
-    ObjectLookup{obj: Box<Expr>, lookup: Box<Expr>},
+    ObjectLookup {
+        obj: Box<Expr>,
+        lookup: Box<Expr>,
+    },
 
     Sequence(Vec<Expr>),
     Array(Vec<Expr>),
     Literal(Value),
     VarRef(VarRef),
 }
-
 
 //
 // Lexical elements
@@ -257,9 +263,10 @@ fn postfix_expr(i: &str) -> IResult<&str, Expr> {
     fn apply_postfix_apply(pf_apply: PostfixApply, e: Expr) -> Expr {
         match pf_apply {
             PostfixApply::ArrayUnbox => Expr::ArrayUnbox(Box::new(e)),
-            PostfixApply::ObjectLookup(lookup) => {
-                Expr::ObjectLookup{obj: Box::new(e), lookup: Box::new(lookup)}
-            }
+            PostfixApply::ObjectLookup(lookup) => Expr::ObjectLookup {
+                obj: Box::new(e),
+                lookup: Box::new(lookup),
+            },
         }
     }
 
@@ -344,7 +351,7 @@ fn parse_let_binding<'a>(i: &'a str) -> IResult<&'a str, (VarRef, Expr)> {
 fn parse_let_line(i: &str) -> IResult<&str, Vec<(VarRef, Expr)>> {
     let (remaining, (_, bindings)) = tuple((
         ws0::after(kw("let")),
-        separated_list1(ws0::after(char(',')), parse_let_binding),
+        cut(separated_list1(ws0::after(char(',')), parse_let_binding)),
     ))(i)?;
     Ok((remaining, bindings))
 }
@@ -361,26 +368,34 @@ fn parse_return(i: &str) -> IResult<&str, Expr> {
 
 fn parse_flwor(i: &str) -> IResult<&str, Expr> {
     // TODO: rest
+    let mut parse_initial = alt((
+        map(ws0::after(parse_for_line), FLWORClause::For),
+        map(ws0::after(parse_let_line), FLWORClause::Let),
+    ));
+    let parse_clause = alt((
+        map(ws0::after(parse_for_line), FLWORClause::For),
+        map(ws0::after(parse_let_line), FLWORClause::Let),
+        map(ws0::after(parse_where_line), |s| {
+            FLWORClause::Where(Box::new(s))
+        }),
+        // TODO: order by
+    ));
 
-    let (remaining, (for_line, let_line_opt, where_line_opt, ret_expr)) =
-        tuple((
-            ws0::after(parse_for_line),
-            opt(ws0::after(parse_let_line)),
-            opt(ws0::after(parse_where_line)),
-            parse_return,
-        ))(i)?;
-    Ok((
-        remaining,
+    let (i, first_clause) = parse_initial(i)?;
+    let (i, mut subsequent) = many0(parse_clause)(i)?;
+
+    let (i, return_) = parse_return(i)?;
+
+    let mut clauses = vec![first_clause];
+    clauses.append(&mut subsequent);
+
+    return Ok((
+        i,
         Expr::For {
-            for_: for_line,
-            let_: let_line_opt.unwrap_or_default(),
-            where_: Box::new(
-                where_line_opt.unwrap_or(Expr::Literal(json!(true))),
-            ),
-            order: vec![],
-            return_: Box::new(ret_expr),
+            clauses,
+            return_: Box::new(return_),
         },
-    ))
+    ));
 }
 
 fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
@@ -392,9 +407,8 @@ fn parse_sequence<'a>(i: &'a str) -> IResult<&'a str, Vec<Expr>> {
     separated_list1(ws0::after(char(',')), ws0::after(parse_expr)).parse(i)
 }
 
-// fncall identified , terminated('(', many0(expr)  ')')
-
 pub fn parse_main_module(i: &str) -> IResult<&str, Expr> {
+    // FIXME: this should be parse_sequence
     all_consuming(parse_flwor)(i)
 }
 
@@ -629,14 +643,21 @@ mod tests {
             Ok((
                 "",
                 Expr::For {
-                    for_: vec![(VarRef::from("x"), Expr::Sequence(vec![]))],
-                    let_: vec![(VarRef::from("y"), Expr::VarRef("x".into()))],
-                    where_: Box::new(Expr::Comp(
-                        CompOp::LT,
-                        Box::new(Expr::VarRef("x".into())),
-                        Box::new(Expr::Literal(json!(3.0))),
-                    )),
-                    order: vec![],
+                    clauses: vec![
+                        FLWORClause::For(vec![(
+                            VarRef::from("x"),
+                            Expr::Sequence(vec![])
+                        )]),
+                        FLWORClause::Let(vec![(
+                            VarRef::from("y"),
+                            Expr::VarRef("x".into())
+                        )]),
+                        FLWORClause::Where(Box::new(Expr::Comp(
+                            CompOp::LT,
+                            Box::new(Expr::VarRef("x".into())),
+                            Box::new(Expr::Literal(json!(3.0))),
+                        ))),
+                    ],
                     return_: Box::new(Expr::Array(vec![
                         Expr::VarRef("x".into()),
                         Expr::VarRef("y".into()),

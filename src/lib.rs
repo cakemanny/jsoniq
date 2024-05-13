@@ -9,7 +9,7 @@ use std::vec;
 
 pub mod ast;
 pub mod parse;
-use crate::ast::{CompOp, Expr, VarRef};
+use crate::ast::{CompOp, Expr, FLWORClause, VarRef};
 
 // I am thinking we'll have a few different implementations of
 // Sequence. e.g. backed by a collection, backend by
@@ -200,11 +200,104 @@ where
     }
 }
 
-// In the next iteration of this eval_query, we will need to recursively
-// chain together the fors.
-// I think we may also want to have the notion of binding streams to
-// variables...
-//
+struct FLWORChain {
+    clause: FLWORClause,
+    parent: Option<Box<FLWORChain>>,
+}
+
+impl FLWORChain {
+    fn iter<'a, 'ctx>(
+        &'a self,
+        bindings: &Bindings,
+        ctx: &'ctx DynamicContext,
+    ) -> Box<dyn Iterator<Item = anyhow::Result<Bindings>> + 'a>
+    where
+        'ctx: 'a,
+    {
+        use FLWORClause::*;
+        match &self.clause {
+            For(for_) => match &self.parent {
+                Some(chain) => Box::new(chain.iter(bindings, ctx).flat_map(
+                    move |inner_bindings_result| match inner_bindings_result {
+                        Ok(inner_bindings) => {
+                            forexp_to_iter(&for_, inner_bindings, ctx)
+                        }
+                        Err(e) => Box::new(Some(Err(e)).into_iter()),
+                    },
+                )),
+                None => forexp_to_iter(&for_, bindings.clone(), ctx),
+            },
+            Let(let_) => {
+                match &self.parent {
+                    Some(chain) => {
+                        Box::new(chain.iter(bindings, ctx).map(
+                            |bindings_result| {
+                                let mut bindings = bindings_result?;
+
+                                // Let bindings
+                                for let_binding in let_.iter() {
+                                    // I think we have to assume at this point that
+                                    // the the expressions have been checked
+                                    let data = eval_expr(
+                                        &let_binding.1,
+                                        &bindings,
+                                        ctx,
+                                    )?;
+                                    bindings.insert(
+                                        let_binding.0.ref_.to_owned(),
+                                        data,
+                                    );
+                                }
+                                Ok(bindings)
+                            },
+                        ))
+                    }
+                    None => {
+                        Box::new(Some(Bindings::new()).into_iter().map(
+                            |mut bindings| {
+                                for (var_ref, expr) in let_.iter() {
+                                    // I think we have to assume at this point that
+                                    // the the expressions have been checked
+                                    let data =
+                                        eval_expr(&expr, &bindings, ctx)?;
+                                    bindings
+                                        .insert(var_ref.ref_.to_owned(), data);
+                                }
+                                Ok(bindings)
+                            },
+                        ))
+                    }
+                }
+            }
+            Where(where_) => {
+                // unwrap: Where is never the first clause.
+                Box::new(
+                    self.parent
+                        .as_ref()
+                        .unwrap()
+                        .iter(bindings, ctx)
+                        .filter_map(move |bindings_result| {
+                            let bindings = match bindings_result {
+                                Ok(bindings) => bindings,
+                                Err(e) => return Some(Err(e)),
+                            };
+                            let get_cond_as_bool = || {
+                                Ok(eval_expr(&where_, &bindings, ctx)?
+                                    .try_into()?)
+                            };
+                            match get_cond_as_bool() {
+                                Err(e) => return Some(Err(e)),
+                                Ok(false) => return None,
+                                Ok(true) => Some(Ok(bindings)),
+                            }
+                        }),
+                )
+            }
+            Order(_) => todo!("order by"),
+        }
+    }
+}
+
 // We ought to rewrite as multiple passes,
 // one that does some sort of preparation of sources (e.g. collections)
 fn eval_query(
@@ -213,60 +306,34 @@ fn eval_query(
     ctx: &DynamicContext,
 ) -> anyhow::Result<Box<dyn Iterator<Item = Value>>> {
     match expr {
-        Expr::For {
-            for_,
-            let_,
-            where_,
-            order: _, // TODO: implement ordering
-            return_,
-        } => {
-            // 1. evaluate the rhs of the for_, and convert to a sequence
-            // 2. for each tuple in the sequence
-            //    bind the value to the variable in a map
-            // 2. evaluate the let_ with the map, for each tuple, producing a new map
-            // 3. filter the tuples
-            // 4. ignore the order clause for now
-            // 5. evaluate the return_ expr and call consume on it
+        Expr::For { clauses, return_ } => {
+            let mut clauses = clauses.to_owned();
+            let subsequent = clauses.split_off(1);
+            // Our parser enforces a For or Let at the start;
+            let first_clause = clauses.pop().unwrap();
 
-            // Start off basic
-            if for_.is_empty() {
-                anyhow::bail!("Need for for now");
+            let mut clause_chain = FLWORChain {
+                clause: first_clause,
+                parent: None,
+            };
+            for clause in subsequent.into_iter() {
+                clause_chain = FLWORChain {
+                    clause,
+                    parent: Some(Box::new(clause_chain)),
+                }
             }
 
-            let value_stream = forexp_to_iter(for_, bindings.clone(), ctx)
+            let value_stream = clause_chain
+                .iter(bindings, ctx)
                 .map(|bindings_result| {
-                    let mut bindings = bindings_result?;
-
-                    // Let bindings
-                    for let_binding in let_.iter() {
-                        // I think we have to assume at this point that
-                        // the the expressions have been checked
-                        let data = eval_expr(&let_binding.1, &bindings, ctx)?;
-                        bindings.insert(let_binding.0.ref_.to_owned(), data);
-                    }
-                    Ok(bindings)
-                })
-                .filter_map(|bindings_result| {
-                    let bindings = match bindings_result {
-                        Ok(bindings) => bindings,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    let get_cond_as_bool =
-                        || Ok(eval_expr(&where_, &bindings, ctx)?.try_into()?);
-                    match get_cond_as_bool() {
-                        Err(e) => return Some(Err(e)),
-                        Ok(false) => return None,
-                        // we fall through so that evaluation of return_ is
-                        // a bit separated from evaluation of where
-                        Ok(true) => {}
-                    }
-                    Some(eval_expr(&return_, &bindings, ctx))
+                    let bindings = bindings_result?;
+                    eval_expr(&return_, &bindings, ctx)
                 })
                 .flat_map(data_result_to_value_results)
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter();
 
-            Ok(Box::new(value_stream))
+            return Ok(Box::new(value_stream));
         }
         _ => Err(anyhow!("top level expression must be a FLWOR")),
     }
@@ -354,10 +421,12 @@ fn eval_expr(
     ctx: &DynamicContext,
 ) -> anyhow::Result<Data> {
     match expr {
-        // This shouldn't be the case
-        // it should just be the case that we consume the stream
-        // TODO: actually nested FLWOR is supported
-        Expr::For { .. } => Err(anyhow!("No FLWOR at this point")),
+        Expr::For { .. } => {
+            // FIXME: we ought not to force all the data into memory
+            let evaluated: Vec<_> =
+                eval_query(expr, bindings, ctx)?.collect::<Vec<_>>();
+            Ok(Data::Value(Value::Array(evaluated)))
+        }
         Expr::FnCall((_nsopt, name), args) => {
             // We should define a static pass that checks this before
             // execution.
@@ -598,61 +667,75 @@ fn check_expr(
     type E = ValidationError;
 
     match expr {
-        parse::Expr::For {
-            for_,
-            let_,
-            where_,
-            order,
-            return_,
-        } => {
+        parse::Expr::For { clauses, return_ } => {
             // We work a bit non-functionaly in the sense that we are
             // mutating the scope as we work through the expression in
             // evaluation order.
             let mut new_scope = Scope::with_parent(scope);
 
-            let checked_for = for_.into_iter().try_fold(
-                Vec::new(),
-                |mut acc, (var, expr)| {
-                    let checked = check_expr(expr, &new_scope, ctx)?;
-                    // When we do typing, this is where the difference between for
-                    // and let below would show themselves. As the type of the
-                    // bound variable in a for is the type of the sequence elements
-                    // when the expression is a sequence...
-
-                    new_scope.names.insert(var.ref_.clone());
-                    acc.push((var.into(), checked));
-                    Ok::<_, E>(acc)
-                },
-            )?;
-            let checked_let = let_.into_iter().try_fold(
-                Vec::new(),
-                |mut acc, (var, expr)| {
-                    let checked = check_expr(expr, &new_scope, ctx)?;
-                    new_scope.names.insert(var.ref_.clone());
-                    acc.push((var.into(), checked));
-                    Ok::<_, E>(acc)
-                },
-            )?;
-            let checked_where = Box::new(check_expr(*where_, &new_scope, ctx)?);
-            // since order doesn't introduce any bindings it would definitely
-            // be possible to check each part of the order clause individually
-            // when we come to that.
-            let checked_order = order
+            let checked_clauses = clauses
                 .into_iter()
-                .map(|(term, ord)| {
-                    let checked_term = check_expr(term, &new_scope, ctx)?;
-                    Ok::<_, E>((checked_term, ord.into()))
+                .map(|clause| {
+                    match clause {
+                        parse::FLWORClause::For(for_) => {
+                            let checked_for = for_.into_iter().try_fold(
+                                Vec::new(),
+                                |mut acc, (var, expr)| {
+                                    let checked =
+                                        check_expr(expr, &new_scope, ctx)?;
+                                    // When we do typing, this is where the difference between for
+                                    // and let below would show themselves. As the type of the
+                                    // bound variable in a for is the type of the sequence elements
+                                    // when the expression is a sequence...
+
+                                    new_scope.names.insert(var.ref_.clone());
+                                    acc.push((var.into(), checked));
+                                    Ok::<_, E>(acc)
+                                },
+                            )?;
+                            Ok(FLWORClause::For(checked_for))
+                        }
+                        parse::FLWORClause::Let(let_) => {
+                            let checked_let = let_.into_iter().try_fold(
+                                Vec::new(),
+                                |mut acc, (var, expr)| {
+                                    let checked =
+                                        check_expr(expr, &new_scope, ctx)?;
+                                    new_scope.names.insert(var.ref_.clone());
+                                    acc.push((var.into(), checked));
+                                    Ok::<_, E>(acc)
+                                },
+                            )?;
+                            Ok(FLWORClause::Let(checked_let))
+                        }
+                        parse::FLWORClause::Where(where_) => {
+                            let checked_where =
+                                Box::new(check_expr(*where_, &new_scope, ctx)?);
+                            Ok(FLWORClause::Where(checked_where))
+                        }
+                        parse::FLWORClause::Order(order) => {
+                            // since order doesn't introduce any bindings it would definitely
+                            // be possible to check each part of the order clause individually
+                            // when we come to that.
+                            let checked_order = order
+                                .into_iter()
+                                .map(|(term, ord)| {
+                                    let checked_term =
+                                        check_expr(term, &new_scope, ctx)?;
+                                    Ok::<_, E>((checked_term, ord.into()))
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(FLWORClause::Order(checked_order))
+                        }
+                    }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, E>>()?;
 
             let checked_return =
                 Box::new(check_expr(*return_, &new_scope, ctx)?);
 
             Ok(Expr::For {
-                for_: checked_for,
-                let_: checked_let,
-                where_: checked_where,
-                order: checked_order,
+                clauses: checked_clauses,
                 return_: checked_return,
             })
         }
@@ -737,8 +820,7 @@ fn check_expr(
         parse::Expr::Literal(v) => Ok(Expr::Literal(v)),
         parse::Expr::VarRef(var_ref) => {
             let mut maybe_scope = Some(scope);
-            while maybe_scope.is_some() {
-                let s = maybe_scope.unwrap();
+            while let Some(s) = maybe_scope {
                 if s.names.contains(var_ref.ref_.as_str()) {
                     return Ok(Expr::VarRef(var_ref.into()));
                 }
