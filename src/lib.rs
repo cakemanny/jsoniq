@@ -425,7 +425,8 @@ fn eval_expr(
             // FIXME: we ought not to force all the data into memory
             let evaluated: Vec<_> =
                 eval_query(expr, bindings, ctx)?.collect::<Vec<_>>();
-            Ok(Data::Value(Value::Array(evaluated)))
+
+            Ok(Data::Sequence(Sequence::VecBackend(evaluated)))
         }
         Expr::FnCall((_nsopt, name), args) => {
             // We should define a static pass that checks this before
@@ -931,7 +932,7 @@ fn base_fn_library() -> FnTable {
 }
 
 pub fn run_program<W: Write>(program: &str, mut out: W) -> anyhow::Result<()> {
-    let (_, expr) = parse::parse_main_module(program)
+    let (_, exprs) = parse::parse_main_module(program)
         .map_err(|e| anyhow::Error::new(e.to_owned()))?;
 
     let static_ctx = StaticContext {
@@ -941,17 +942,29 @@ pub fn run_program<W: Write>(program: &str, mut out: W) -> anyhow::Result<()> {
     // There could now be a type checking phase that references static
     // context.
 
-    let scope_chain = Scope::new();
-    let expr = check_expr(expr, &scope_chain, &static_ctx)?;
+    let exprs = exprs.into_iter().map(|expr| {
+        let scope_chain = Scope::new();
+        Ok(check_expr(expr, &scope_chain, &static_ctx)?)
+    }).collect::<Result<Vec<_>,anyhow::Error>>()?;
 
     let ctx = DynamicContext {
         stat_ctx: static_ctx,
         json_file_contents: Mutex::new(HashMap::new()),
     };
 
-    let bindings = Bindings::new();
-    eval_query(&expr, &bindings, &ctx)?
-        .try_for_each(|value| writeln!(out, "{value}"))?;
+    for expr in &exprs {
+        let bindings = Bindings::new();
+        match eval_expr(&expr, &bindings, &ctx)? {
+            Data::Sequence(seq) => {
+                seq.get_iter()
+                    .try_for_each(|value| writeln!(out, "{value}"))?;
+            }
+            Data::Value(value) => {
+                writeln!(out, "{value}")?;
+            }
+            Data::EmptySequence => {}
+        }
+    }
 
     Ok(())
 }

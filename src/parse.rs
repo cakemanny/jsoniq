@@ -400,16 +400,19 @@ fn parse_flwor(i: &str) -> IResult<&str, Expr> {
 
 fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr> {
     // TODO: logicals, arithmetic
-    comparison_expr(i)
+    alt((
+        parse_flwor,
+        comparison_expr, // should be part of an Or expr
+    ))(i)
 }
 
 fn parse_sequence<'a>(i: &'a str) -> IResult<&'a str, Vec<Expr>> {
     separated_list1(ws0::after(char(',')), ws0::after(parse_expr)).parse(i)
 }
 
-pub fn parse_main_module(i: &str) -> IResult<&str, Expr> {
+pub fn parse_main_module(i: &str) -> IResult<&str, Vec<Expr>> {
     // FIXME: this should be parse_sequence
-    all_consuming(parse_flwor)(i)
+    all_consuming(parse_sequence)(i)
 }
 
 #[cfg(test)]
